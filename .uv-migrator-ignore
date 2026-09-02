@@ -1,0 +1,33 @@
+# ========================================================
+# uv-migrator 'Do Not Touch' / Ignore Configuration
+# ========================================================
+# Virtual environments matching any of these patterns will be
+# skipped and left untouched during scan and migration.
+# Uses standard glob syntax (case-sensitive or insensitive per OS).
+
+# --- Version Control & Build Artifacts ---
+**/.git/**
+**/node_modules/**
+**/target/**
+**/build/**
+**/dist/**
+**/__pycache__/**
+
+# --- Conda / Mamba Environments (Protected by default) ---
+# Conda env: D:\Usuarios\crenaudo\.conda\envs\mfix-26.1.1\python.exe
+**/mfix-26.1.1/**
+# Conda env: D:\aplicaciones\miniforge3\python.exe
+**/miniforge3/**
+# Conda env: D:\Usuarios\crenaudo\.julia\conda\3\x86_64\python.exe
+**/x86_64/**
+# Conda env: D:\aplicaciones\minicondaorange\python.exe
+**/minicondaorange/**
+**/miniconda3/**
+**/anaconda3/**
+**/miniforge3/**
+
+# --- Custom Do-Not-Touch Folders ---
+# Add any legacy project folders or environments you want untouched:
+# **/legacy_system_app/**
+# **/do_not_touch/**
+# **/third_party/**
