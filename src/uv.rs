@@ -140,82 +140,42 @@ pub fn uv_python_install(uv_path: &Path, version: &str) -> Result<String, String
     }
 }
 
-/// Create a new uv-managed virtual environment at `.venv`
-pub fn uv_create_venv(uv_path: &Path, project_dir: &Path, python_version: Option<&str>) -> Result<(), String> {
+/// Create a new uv-managed virtual environment at `venv_dir`, which must not exist yet.
+pub fn uv_create_venv(
+    uv_path: &Path,
+    venv_dir: &Path,
+    python_version: &str,
+    system_site_packages: bool,
+) -> Result<(), String> {
     let mut cmd = Command::new(uv_path);
-    cmd.current_dir(project_dir);
-    cmd.arg("venv");
-
-    if let Some(ver) = python_version {
-        cmd.arg("--python").arg(ver);
+    cmd.arg("venv").arg("--python").arg(python_version);
+    if system_site_packages {
+        cmd.arg("--system-site-packages");
     }
-    cmd.arg(".venv");
+    cmd.arg(venv_dir);
 
     let output = cmd.output().map_err(|e| format!("Failed to run 'uv venv': {}", e))?;
     if output.status.success() {
         Ok(())
     } else {
         let err = String::from_utf8_lossy(&output.stderr);
-        // Retry with --allow-existing or --clear if leftover files
-        let mut retry_cmd = Command::new(uv_path);
-        retry_cmd.current_dir(project_dir);
-        retry_cmd.args(["venv", "--allow-existing"]);
-        if let Some(ver) = python_version {
-            retry_cmd.arg("--python").arg(ver);
-        }
-        retry_cmd.arg(".venv");
-
-        let retry_out = retry_cmd.output().map_err(|e| format!("Failed retry 'uv venv': {}", e))?;
-        if retry_out.status.success() {
-            Ok(())
-        } else {
-            Err(format!("Failed to create uv venv in {:?}: {}", project_dir, err))
-        }
+        Err(format!("uv venv failed for Python {}: {}", python_version, err.trim()))
     }
 }
 
-/// Install dependencies from requirements.txt via `uv pip install -r <file>`
-pub fn uv_pip_install_requirements(uv_path: &Path, project_dir: &Path, req_file: &Path) -> Result<(), String> {
-    let mut cmd = Command::new(uv_path);
-    cmd.current_dir(project_dir);
-    cmd.args(["pip", "install", "-r"]);
-    cmd.arg(req_file);
-
-    let output = cmd.output().map_err(|e| format!("Failed to run 'uv pip install -r': {}", e))?;
+/// Install a requirements file into the environment that owns `python`.
+pub fn uv_pip_install_requirements(uv_path: &Path, python: &Path, req_file: &Path) -> Result<(), String> {
+    let output = Command::new(uv_path)
+        .args(["pip", "install", "--python"])
+        .arg(python)
+        .arg("-r")
+        .arg(req_file)
+        .output()
+        .map_err(|e| format!("Failed to run 'uv pip install -r': {}", e))?;
     if output.status.success() {
         Ok(())
     } else {
         let err = String::from_utf8_lossy(&output.stderr);
-        Err(format!("uv pip install -r failed: {}", err))
-    }
-}
-
-/// Install project package editable via `uv pip install -e .`
-pub fn uv_pip_install_editable(uv_path: &Path, project_dir: &Path) -> Result<(), String> {
-    let mut cmd = Command::new(uv_path);
-    cmd.current_dir(project_dir);
-    cmd.args(["pip", "install", "-e", "."]);
-
-    let output = cmd.output().map_err(|e| format!("Failed to run 'uv pip install -e .': {}", e))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let err = String::from_utf8_lossy(&output.stderr);
-        Err(format!("uv pip install -e . failed: {}", err))
-    }
-}
-
-/// Sync project environment via `uv sync`
-pub fn uv_sync(uv_path: &Path, project_dir: &Path) -> Result<(), String> {
-    let mut cmd = Command::new(uv_path);
-    cmd.current_dir(project_dir);
-    cmd.arg("sync");
-
-    let output = cmd.output().map_err(|e| format!("Failed to run 'uv sync': {}", e))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        let err = String::from_utf8_lossy(&output.stderr);
-        Err(format!("uv sync failed: {}", err))
+        Err(format!("uv pip install -r failed: {}", err.trim()))
     }
 }

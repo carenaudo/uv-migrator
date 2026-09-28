@@ -16,7 +16,12 @@ Traditional Python virtual environments (`venv`, `virtualenv`) copy entire stand
 
 **`uv-migrator`** is built with safety, transparency, and reliability as core principles:
 1. **Never Touch System Packages**: Operations are strictly restricted to isolated project virtual environments. System CPython or base Conda installations are never altered.
-2. **Zero Data Loss**: If a project does not contain a `pyproject.toml` or `requirements.txt`, `uv-migrator` automatically snapshots all installed packages and their exact versions directly from `.dist-info` metadata before migration.
+2. **Never Leave a Project Without an Environment**: Each migration runs in an order that can be undone:
+   1. Every installed package is written to a sidecar snapshot (`<venv>.uv-migrator-snapshot.txt`, next to the environment) **with its source**: editable checkouts, VCS commits and local paths are kept as such, not flattened to `name==version`. The snapshot is always taken, whatever manifests the project has, and `requirements.txt` is never modified.
+   2. The old environment is **moved aside** (`<venv>.uv-migrator-backup`), not deleted.
+   3. The new environment is built in its place from the snapshot, with pins intact. There is no fallback that drops version bounds.
+   4. The result is **verified**: every package from the snapshot must be installed at the same version.
+   5. Only then is the old environment deleted. If any step fails, the new one is removed and the original is moved back.
 3. **Flexible Ignore System**: Easily protect sensitive folders, production environments, and Conda installations using `.uv-migrator-ignore` patterns.
 4. **Lightweight & Self-Contained**:
    - **CLI (`uv-migrator`)**: ~3.1 MB native binary.
@@ -39,9 +44,9 @@ Traditional Python virtual environments (`venv`, `virtualenv`) copy entire stand
 - 🛡️ **Do-Not-Touch Engine**:
   - Full `.gitignore`-style wildcard pattern support.
   - Built-in presets for Conda base directories, VCS folders, and production workloads.
-- 🧪 **Dry-Run Mode & Live Disk Space Gauge**:
-  - Simulate migrations safely without touching any files.
-  - Real-time progress bar, detailed activity logs, and a reclaimed disk space counter.
+- 🧪 **Dry-Run Mode & Disk Space Report**:
+  - Simulate migrations without touching any files: shows the target Python and how many packages would be rebuilt and verified. It does not guess the new size.
+  - Real-time progress bar and activity logs. Reclaimed space is reported as the change in free space on the volume, which is the honest figure: uv hardlinks packages from a shared cache, so summing file sizes inside each new environment overstates it.
 - 🌐 **Cross-Platform**:
   - First-class support for **Windows, macOS, Linux, FreeBSD, OpenBSD, and NetBSD**.
 

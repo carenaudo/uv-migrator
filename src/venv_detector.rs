@@ -66,6 +66,7 @@ pub fn scan_virtual_environments(
             || file_name == ".vscode"
             || file_name == ".pytest_cache"
             || file_name == ".mypy_cache"
+            || file_name.ends_with(crate::migrator::BACKUP_SUFFIX)
         {
             it.skip_current_dir();
             continue;

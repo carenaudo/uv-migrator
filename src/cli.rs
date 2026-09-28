@@ -4,7 +4,7 @@ use clap::{Args, Parser, Subcommand};
 #[derive(Parser, Debug)]
 #[command(
     name = "uv-migrator",
-    author = "Antigravity",
+    author = clap::crate_authors!(", "),
     version = "0.1.0",
     about = "Cross-platform CLI tool to discover, scan, and safely migrate Python virtual environments to uv",
     long_about = "⚡ uv-migrator scans and identifies Python virtual environments across your system and safely migrates them to uv-managed virtual environments, reducing disk footprint via hardlinks and providing clean Python version upgrade options without ever touching system Python packages."
@@ -115,4 +115,15 @@ pub struct InitArgs {
     /// Overwrite existing .uv-migrator-ignore file
     #[arg(short, long)]
     pub force: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn author_comes_from_cargo_toml() {
+        assert_eq!(Cli::command().get_author(), Some("carenaudo, Antigravity"));
+    }
 }

@@ -142,10 +142,18 @@ pub fn print_migration_summary(
 
         let note = if let Some(ref e) = r.error {
             format!(" - {}", e.red())
-        } else if r.snapshot_created {
-            " (snapshot requirements.txt created)".dimmed().to_string()
+        } else if let Some(ref p) = r.snapshot_path {
+            format!(" (snapshot: {})", p.display()).dimmed().to_string()
         } else {
             String::new()
+        };
+
+        let new_size = if r.dry_run {
+            format!("{} pkgs to verify", r.package_count).dimmed().to_string()
+        } else if r.success {
+            format_bytes(r.new_size_bytes).green().to_string()
+        } else {
+            "-".to_string()
         };
 
         println!(
@@ -156,7 +164,7 @@ pub fn print_migration_summary(
             r.old_python_version,
             r.new_python_version.bold().cyan(),
             format_bytes(r.old_size_bytes),
-            format_bytes(r.new_size_bytes).green(),
+            new_size,
             status,
             note
         );
@@ -165,15 +173,25 @@ pub fn print_migration_summary(
     println!("{:-<80}", "");
     println!("Environments Processed: {} | Succeeded: {} | Failed: {}", results.len(), success_count, fail_count);
     println!("Total Old Footprint: {}", format_bytes(old_total).yellow());
-    println!("Total New Footprint: {}", format_bytes(new_total).green().bold());
+    if dry_run {
+        println!("Total New Footprint: {}", "not measured in a dry run".dimmed());
+        return;
+    }
+    println!(
+        "Total New Footprint: {} {}",
+        format_bytes(new_total).green().bold(),
+        "(apparent size; counts files uv hardlinks from its cache in full)".dimmed()
+    );
 
     if let (Some(init_f), Some(fin_f)) = (initial_free_gb, final_free_gb) {
         let diff = fin_f - init_f;
         println!("Initial Free Disk Space: {:.2} GB", init_f);
         println!("Current Free Disk Space: {:.2} GB", fin_f);
-        if diff >= 0.0 {
-            println!("Disk Space Reclaimed:    {} (+ shared hardlinks)", format!("{:.2} GB", diff).green().bold());
-        }
+        println!(
+            "Disk Space Reclaimed:    {} {}",
+            format!("{:.2} GB", diff).green().bold(),
+            "(change in free space on the volume, including uv's cache)".dimmed()
+        );
     }
 }
 

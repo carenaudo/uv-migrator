@@ -2,7 +2,7 @@
 name = "uv-migrator"
 version = "0.1.0"
 edition = "2021"
-authors = ["Antigravity"]
+authors = ["carenaudo", "Antigravity"]
 description = "Cross-platform CLI and GUI to discover, scan, and safely migrate Python virtual environments to uv"
 
 [lib]
