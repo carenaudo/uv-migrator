@@ -3,6 +3,7 @@ mod ignore;
 mod migrator;
 mod platform;
 mod python_detector;
+mod snapshot;
 mod ui;
 mod uv;
 mod venv_detector;

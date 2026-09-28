@@ -251,8 +251,11 @@ impl UvMigratorApp {
                 BackgroundEvent::MigrationProgress { index, total, rel_path, result } => {
                     self.progress_fraction = index as f32 / total.max(1) as f32;
                     self.progress_text = format!("[{}/{}] Migrated {}", index, total, rel_path);
-                    let log_line = if result.success {
-                        format!("✔ [{}/{}] {} ({} -> {})", index, total, rel_path, format_bytes(result.old_size_bytes), format_bytes(result.new_size_bytes))
+                    let log_line = if result.success && result.dry_run {
+                        format!("✔ [{}/{}] {} (dry run: {} packages to rebuild and verify)", index, total, rel_path, result.package_count)
+                    } else if result.success {
+                        let note = result.error.as_deref().map(|e| format!(" - {}", e)).unwrap_or_default();
+                        format!("✔ [{}/{}] {} ({} -> {}, {} packages verified){}", index, total, rel_path, format_bytes(result.old_size_bytes), format_bytes(result.new_size_bytes), result.package_count, note)
                     } else {
                         format!("✖ [{}/{}] {} - Error: {}", index, total, rel_path, result.error.as_deref().unwrap_or("Unknown"))
                     };
@@ -656,7 +659,12 @@ impl UvMigratorApp {
                     ui.vertical(|ui| {
                         ui.label(RichText::new(format!("Processed: {}/{}", success_count, self.migration_results.len())).strong().size(15.0));
                         ui.label(format!("Old Footprint: {}", format_bytes(old_total)));
-                        ui.label(format!("New Footprint: {}", format_bytes(new_total)));
+                        if self.migration_results.iter().any(|r| r.dry_run) {
+                            ui.label("New Footprint: not measured in a dry run");
+                        } else {
+                            ui.label(format!("New Footprint: {} (apparent size)", format_bytes(new_total)))
+                                .on_hover_text("Counts files uv hardlinks from its cache in full. The change in free space is the real figure.");
+                        }
                     });
 
                     ui.add_space(30.0);

@@ -3,8 +3,12 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use crate::platform::{dir_size_bytes, venv_python_path};
 use crate::python_detector::{find_latest_minor_version, find_latest_overall_version, PythonRuntime};
-use crate::uv::{uv_create_venv, uv_pip_install_editable, uv_pip_install_requirements, uv_python_install, uv_sync, UvInfo};
+use crate::snapshot::{self, InstalledPackage};
+use crate::uv::{uv_create_venv, uv_pip_install_requirements, uv_python_install, UvInfo};
 use crate::venv_detector::VenvInfo;
+
+/// Suffix of the directory the old environment is moved to while its replacement is built.
+pub const BACKUP_SUFFIX: &str = ".uv-migrator-backup";
 
 #[derive(Debug, Clone)]
 pub struct MigrationOptions {
@@ -19,120 +23,154 @@ pub struct MigrationOptions {
 pub struct MigrationResult {
     pub rel_path: String,
     pub project_dir: PathBuf,
+    pub dry_run: bool,
     pub old_size_bytes: u64,
+    /// Apparent size of the new environment. Files uv hardlinks from its cache are counted
+    /// in full, so this overstates what the environment adds; the change in free space on
+    /// the volume is the real figure. Zero in a dry run, where nothing is measured.
     pub new_size_bytes: u64,
     pub old_python_version: String,
     pub new_python_version: String,
+    /// Number of packages recorded in the snapshot and required in the new environment.
+    pub package_count: usize,
     pub success: bool,
     pub error: Option<String>,
-    pub snapshot_created: bool,
+    pub snapshot_path: Option<PathBuf>,
+    /// The migration failed and the original environment was put back.
+    pub restored: bool,
 }
 
+/// Migrate one environment without ever leaving the project without one:
+///
+/// 1. snapshot every installed package, with its source, to a sidecar file;
+/// 2. move the old environment aside (not delete it);
+/// 3. build the new one in its place from the snapshot;
+/// 4. verify that the same packages are installed at the same versions;
+/// 5. only then delete the old environment. If any step fails, put it back.
 pub fn migrate_environment(
     venv: &VenvInfo,
     uv: &UvInfo,
     detected_pythons: &[PythonRuntime],
     options: &MigrationOptions,
 ) -> MigrationResult {
+    let installed = snapshot::read_installed(&venv.venv_dir);
     let mut result = MigrationResult {
         rel_path: venv.rel_path.clone(),
         project_dir: venv.project_dir.clone(),
+        dry_run: options.dry_run,
         old_size_bytes: venv.size_bytes,
         new_size_bytes: 0,
         old_python_version: venv.python_version_raw.clone(),
-        new_python_version: String::new(),
+        new_python_version: determine_target_python(venv, detected_pythons, options),
+        package_count: installed.len(),
         success: false,
         error: None,
-        snapshot_created: false,
+        snapshot_path: None,
+        restored: false,
     };
-
-    // 1. Determine target Python version
-    let target_python = determine_target_python(venv, detected_pythons, options);
-    result.new_python_version = target_python.clone();
 
     if options.dry_run {
         result.success = true;
-        result.new_size_bytes = (venv.size_bytes as f64 * 0.3) as u64; // estimated
         return result;
     }
 
-    // 2. Ensure target python is available (optional uv install)
     if options.auto_install_python {
-        let _ = uv_python_install(&uv.path, &target_python);
+        let _ = uv_python_install(&uv.path, &result.new_python_version);
     }
 
-    // 3. Snapshot requirements if project lacks dependency manifests
-    let req_file = venv.project_dir.join("requirements.txt");
-    if !venv.has_pyproject && !venv.has_requirements && !venv.has_uv_lock && !venv.has_setup_py {
-        if !venv.installed_packages.is_empty() {
-            let content = venv.installed_packages.join("\n") + "\n";
-            if std::fs::write(&req_file, content).is_ok() {
-                result.snapshot_created = true;
-            }
-        }
+    // 1. Snapshot. Nothing has been touched yet, so a failure here is harmless.
+    let snap_path = snapshot::snapshot_path(&venv.venv_dir);
+    let snap = snapshot::render(&installed, &venv.venv_dir, &venv.python_version_raw);
+    if let Err(e) = std::fs::write(&snap_path, snap) {
+        result.error = Some(format!("Could not write snapshot {}: {} (environment untouched)", snap_path.display(), e));
+        return result;
     }
+    result.snapshot_path = Some(snap_path.clone());
 
-    // 4. Safely delete old virtual environment with retry on Windows
-    if venv.venv_dir.exists() {
-        if let Err(e) = safe_remove_dir_all(&venv.venv_dir) {
-            result.error = Some(format!("Failed to delete old .venv: {}", e));
-            return result;
-        }
+    // 2. Move the old environment aside.
+    let backup = backup_path(&venv.venv_dir);
+    if backup.exists() {
+        result.error = Some(format!(
+            "A backup from an earlier run exists at {}; restore or remove it first (environment untouched)",
+            backup.display()
+        ));
+        return result;
     }
-
-    // 5. Create new uv virtual environment
-    if let Err(e) = uv_create_venv(&uv.path, &venv.project_dir, Some(&target_python)) {
-        result.error = Some(format!("Failed to create uv venv: {}", e));
+    if let Err(e) = rename_with_retry(&venv.venv_dir, &backup) {
+        result.error = Some(format!("Could not move the old environment aside: {} (environment untouched)", e));
         return result;
     }
 
-    // 6. Install project dependencies
-    let mut install_error = None;
-    if venv.has_uv_lock {
-        if let Err(e) = uv_sync(&uv.path, &venv.project_dir) {
-            install_error = Some(e);
+    // 3-4. Build and verify. 5. Delete the old one only on success.
+    let system_site = uses_system_site_packages(&backup);
+    match build_and_verify(uv, &venv.venv_dir, &result.new_python_version, system_site, &snap_path, &installed) {
+        Ok(new_size) => {
+            result.new_size_bytes = new_size;
+            result.success = true;
+            if let Err(e) = safe_remove_dir_all(&backup) {
+                result.error = Some(format!("Migrated, but the old environment could not be deleted and is still at {}: {}", backup.display(), e));
+            }
         }
-    } else if venv.has_pyproject || venv.has_setup_py {
-        if let Err(e) = uv_pip_install_editable(&uv.path, &venv.project_dir) {
-            // Fallback to requirements.txt if editable install fails
-            if req_file.exists() {
-                if let Err(e2) = uv_pip_install_requirements(&uv.path, &venv.project_dir, &req_file) {
-                    install_error = Some(format!("{} | fallback: {}", e, e2));
-                }
+        Err(e) => {
+            let cleared = !venv.venv_dir.exists() || safe_remove_dir_all(&venv.venv_dir).is_ok();
+            if cleared && rename_with_retry(&backup, &venv.venv_dir).is_ok() {
+                result.restored = true;
+                result.error = Some(format!("{} (original environment restored)", e));
             } else {
-                install_error = Some(e);
+                result.error = Some(format!(
+                    "{} -- AND the original environment could not be moved back; it is intact at {}",
+                    e,
+                    backup.display()
+                ));
             }
         }
-    } else if req_file.exists() {
-        if let Err(e) = uv_pip_install_requirements(&uv.path, &venv.project_dir, &req_file) {
-            // Fallback: try installing unpinned package names if strict bounds fail on newer python
-            let fallback_success = try_flexible_install(&uv.path, &venv.project_dir, &req_file);
-            if !fallback_success {
-                install_error = Some(e);
-            }
-        }
-    }
-
-    // 7. Measure new virtualenv size and check python binary
-    let new_venv_dir = venv.project_dir.join(".venv");
-    if new_venv_dir.exists() {
-        result.new_size_bytes = dir_size_bytes(&new_venv_dir);
-        let py_bin = venv_python_path(&new_venv_dir);
-        if py_bin.exists() {
-            if let Some(err) = install_error {
-                result.error = Some(format!("Venv created, but dependency warning: {}", err));
-                result.success = true; // Environment exists and functions
-            } else {
-                result.success = true;
-            }
-        } else {
-            result.error = Some("Virtual environment created but python binary is missing".to_string());
-        }
-    } else {
-        result.error = Some("New .venv directory was not created".to_string());
     }
 
     result
+}
+
+fn build_and_verify(
+    uv: &UvInfo,
+    venv_dir: &Path,
+    target_python: &str,
+    system_site_packages: bool,
+    snap_path: &Path,
+    before: &[InstalledPackage],
+) -> Result<u64, String> {
+    uv_create_venv(&uv.path, venv_dir, target_python, system_site_packages)?;
+    let py = venv_python_path(venv_dir);
+    if !py.exists() {
+        return Err("New environment has no Python binary".to_string());
+    }
+    if !before.is_empty() {
+        uv_pip_install_requirements(&uv.path, &py, snap_path)?;
+    }
+    let after = snapshot::read_installed(venv_dir);
+    let problems = snapshot::diff(before, &after);
+    if !problems.is_empty() {
+        return Err(format!("New environment does not match the old one: {}", problems.join("; ")));
+    }
+    Ok(dir_size_bytes(venv_dir))
+}
+
+pub fn backup_path(venv_dir: &Path) -> PathBuf {
+    let mut name = venv_dir.file_name().unwrap_or_default().to_os_string();
+    name.push(BACKUP_SUFFIX);
+    venv_dir.with_file_name(name)
+}
+
+/// Whether the environment was created with `--system-site-packages`.
+fn uses_system_site_packages(venv_dir: &Path) -> bool {
+    std::fs::read_to_string(venv_dir.join("pyvenv.cfg"))
+        .map(|cfg| {
+            cfg.lines().any(|line| {
+                let mut kv = line.splitn(2, '=');
+                let key = kv.next().unwrap_or("").trim();
+                let val = kv.next().unwrap_or("").trim();
+                key == "include-system-site-packages" && val.eq_ignore_ascii_case("true")
+            })
+        })
+        .unwrap_or(false)
 }
 
 fn determine_target_python(
@@ -184,32 +222,37 @@ fn safe_remove_dir_all(dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn try_flexible_install(uv_path: &Path, project_dir: &Path, req_file: &Path) -> bool {
-    if let Ok(content) = std::fs::read_to_string(req_file) {
-        let mut clean_pkgs = Vec::new();
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                continue;
-            }
-            // Strip version bounds (e.g. numpy==2.0.0 -> numpy)
-            let pkg_name = trimmed.split(&['=', '<', '>', '~', '!'][..]).next().unwrap_or(trimmed).trim();
-            if !pkg_name.is_empty() {
-                clean_pkgs.push(pkg_name.to_string());
-            }
-        }
-
-        if !clean_pkgs.is_empty() {
-            let mut cmd = std::process::Command::new(uv_path);
-            cmd.current_dir(project_dir);
-            cmd.args(["pip", "install"]);
-            for pkg in clean_pkgs {
-                cmd.arg(pkg);
-            }
-            if let Ok(out) = cmd.output() {
-                return out.status.success();
-            }
+/// Rename with a few retries: on Windows an antivirus scan or an indexer can briefly hold
+/// files open inside a freshly used environment.
+fn rename_with_retry(from: &Path, to: &Path) -> std::io::Result<()> {
+    for attempt in 0..5 {
+        match std::fs::rename(from, to) {
+            Ok(_) => return Ok(()),
+            Err(_) if attempt < 4 => std::thread::sleep(Duration::from_millis(200 * (attempt + 1))),
+            Err(e) => return Err(e),
         }
     }
-    false
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backup_sits_next_to_the_venv() {
+        assert_eq!(backup_path(Path::new("/proj/.venv")), Path::new("/proj/.venv.uv-migrator-backup"));
+        assert_eq!(backup_path(Path::new("/proj/venv")), Path::new("/proj/venv.uv-migrator-backup"));
+    }
+
+    #[test]
+    fn reads_system_site_packages_flag() {
+        let dir = std::env::temp_dir().join(format!("uvm-cfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("pyvenv.cfg"), "home = /usr/bin\ninclude-system-site-packages = true\n").unwrap();
+        assert!(uses_system_site_packages(&dir));
+        std::fs::write(dir.join("pyvenv.cfg"), "home = /usr/bin\ninclude-system-site-packages = false\n").unwrap();
+        assert!(!uses_system_site_packages(&dir));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
