@@ -7,7 +7,7 @@
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use crate::platform::find_site_packages_dirs;
+use crate::platform::try_find_site_packages_dirs;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstalledPackage {
@@ -19,35 +19,59 @@ pub struct InstalledPackage {
 }
 
 /// Read every `.dist-info` in the environment's site-packages.
-pub fn read_installed(venv_dir: &Path) -> Vec<InstalledPackage> {
+pub fn read_installed(venv_dir: &Path) -> Result<Vec<InstalledPackage>, String> {
+    let directories = try_find_site_packages_dirs(venv_dir)?;
+    if directories.is_empty() {
+        return Err(format!("No site-packages directory found in {}", venv_dir.display()));
+    }
     let mut pkgs = Vec::new();
-    for sp in find_site_packages_dirs(venv_dir) {
-        let Ok(entries) = std::fs::read_dir(&sp) else { continue };
-        for entry in entries.flatten() {
-            let dir = entry.path();
-            let is_dist_info = dir.is_dir()
-                && dir
-                    .file_name()
-                    .map_or(false, |n| n.to_string_lossy().ends_with(".dist-info"));
-            if is_dist_info {
-                if let Some(pkg) = read_dist_info(&dir) {
-                    pkgs.push(pkg);
+    for sp in directories {
+        let entries = std::fs::read_dir(&sp)
+            .map_err(|error| format!("Could not list {}: {error}", sp.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("Could not read an entry in {}: {error}", sp.display()))?;
+            if entry.file_name().to_string_lossy().ends_with(".dist-info") {
+                let path = entry.path();
+                if !path.is_dir() {
+                    return Err(format!("Could not read package metadata directory {}", path.display()));
                 }
+                pkgs.push(read_dist_info(&path)?);
             }
         }
     }
-    pkgs.sort_by(|a, b| normalize_name(&a.name).cmp(&normalize_name(&b.name)));
-    pkgs
+    pkgs.sort_by_cached_key(|package| normalize_name(&package.name));
+    Ok(pkgs)
 }
 
-fn read_dist_info(dir: &Path) -> Option<InstalledPackage> {
-    let (name, version) = match std::fs::read_to_string(dir.join("METADATA")) {
+fn read_dist_info(dir: &Path) -> Result<InstalledPackage, String> {
+    let metadata_path = dir.join("METADATA");
+    let metadata = match std::fs::read_to_string(&metadata_path) {
         Ok(metadata) => parse_metadata(&metadata),
-        Err(_) => parse_dist_info_dir_name(&dir.file_name()?.to_string_lossy()),
-    }?;
-    let direct_url = std::fs::read_to_string(dir.join("direct_url.json")).ok();
-    let requirement = requirement_line(&name, version.as_deref(), direct_url.as_deref());
-    Some(InstalledPackage { name, version, requirement })
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let filename = dir.file_name().unwrap_or_default().to_string_lossy();
+            parse_dist_info_dir_name(&filename)
+        }
+        Err(error) => return Err(format!("Could not read {}: {error}", metadata_path.display())),
+    };
+    let (name, version) = metadata
+        .filter(|(name, version)| !name.is_empty() && version.as_ref().is_some_and(|v| !v.is_empty()))
+        .ok_or_else(|| format!("Could not determine package name and version from {}", metadata_path.display()))?;
+
+    let direct_url_path = dir.join("direct_url.json");
+    let direct_url = match std::fs::read_to_string(&direct_url_path) {
+        Ok(text) => {
+            let source: serde_json::Value = serde_json::from_str(&text)
+                .map_err(|error| format!("Invalid {}: {error}", direct_url_path.display()))?;
+            if source.get("url").and_then(|url| url.as_str()).is_none_or(str::is_empty) {
+                return Err(format!("Missing URL in {}", direct_url_path.display()));
+            }
+            Some(source)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("Could not read {}: {error}", direct_url_path.display())),
+    };
+    let requirement = requirement_line(&name, version.as_deref(), direct_url.as_ref());
+    Ok(InstalledPackage { name, version, requirement })
 }
 
 /// Name and version from the headers of a METADATA file.
@@ -79,13 +103,12 @@ fn parse_dist_info_dir_name(dir_name: &str) -> Option<(String, Option<String>)> 
 }
 
 /// The `requirements.txt` line that reinstalls a package from where it came from (PEP 610).
-fn requirement_line(name: &str, version: Option<&str>, direct_url_json: Option<&str>) -> String {
+fn requirement_line(name: &str, version: Option<&str>, direct_url: Option<&serde_json::Value>) -> String {
     let pinned = || match version {
         Some(v) => format!("{}=={}", name, v),
         None => name.to_string(),
     };
-    let Some(json) = direct_url_json else { return pinned() };
-    let Ok(du) = serde_json::from_str::<serde_json::Value>(json) else { return pinned() };
+    let Some(du) = direct_url else { return pinned() };
     let Some(url) = du.get("url").and_then(|u| u.as_str()) else { return pinned() };
 
     if let Some(vcs) = du.get("vcs_info") {
@@ -101,10 +124,7 @@ fn requirement_line(name: &str, version: Option<&str>, direct_url_json: Option<&
         }
         return format!("{} @ {}", name, url);
     }
-    if du.get("archive_info").is_some() {
-        return format!("{} @ {}", name, url);
-    }
-    pinned()
+    format!("{} @ {}", name, url)
 }
 
 /// PEP 503 normalisation, so `Foo_Bar` and `foo-bar` compare equal.
@@ -200,17 +220,17 @@ mod tests {
     fn requirement_lines_keep_provenance() {
         assert_eq!(requirement_line("numpy", Some("2.1.0"), None), "numpy==2.1.0");
         let editable = r#"{"url": "file:///home/me/proj", "dir_info": {"editable": true}}"#;
-        assert_eq!(requirement_line("proj", Some("0.1.0"), Some(editable)), "-e file:///home/me/proj");
+        assert_eq!(requirement_line("proj", Some("0.1.0"), Some(&serde_json::from_str(editable).unwrap())), "-e file:///home/me/proj");
         let local = r#"{"url": "file:///home/me/lib", "dir_info": {}}"#;
-        assert_eq!(requirement_line("lib", Some("1.0"), Some(local)), "lib @ file:///home/me/lib");
+        assert_eq!(requirement_line("lib", Some("1.0"), Some(&serde_json::from_str(local).unwrap())), "lib @ file:///home/me/lib");
         let git = r#"{"url": "https://github.com/a/b.git", "vcs_info": {"vcs": "git", "commit_id": "abc123"}}"#;
         assert_eq!(
-            requirement_line("b", Some("0.3"), Some(git)),
+            requirement_line("b", Some("0.3"), Some(&serde_json::from_str(git).unwrap())),
             "b @ git+https://github.com/a/b.git@abc123"
         );
         let wheel = r#"{"url": "file:///tmp/x-1.0-py3-none-any.whl", "archive_info": {}}"#;
-        assert_eq!(requirement_line("x", Some("1.0"), Some(wheel)), "x @ file:///tmp/x-1.0-py3-none-any.whl");
-        assert_eq!(requirement_line("y", Some("1.0"), Some("not json")), "y==1.0");
+        assert_eq!(requirement_line("x", Some("1.0"), Some(&serde_json::from_str(wheel).unwrap())), "x @ file:///tmp/x-1.0-py3-none-any.whl");
+        assert_eq!(requirement_line("y", Some("1.0"), None), "y==1.0");
     }
 
     #[test]

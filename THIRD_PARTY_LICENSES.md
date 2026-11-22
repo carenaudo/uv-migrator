@@ -13,8 +13,6 @@
 | **`egui_extras`** | `0.29` | Extra table widgets and layout loaders for `egui` | MIT / Apache-2.0 |
 | **`rfd`** | `0.15` | Native asynchronous / synchronous OS file and directory dialogs | MIT |
 | **`indicatif`** | `0.18` | Terminal progress bars, counters, and spinners | MIT |
-| **`inquire`** | `0.9` | Interactive CLI prompts and multiselect menus | MIT |
-| **`colored`** | `3.1` | ANSI color formatting for terminal outputs | MPL-2.0 |
 | **`serde`** | `1.0` | Generic data serialization and deserialization framework | MIT / Apache-2.0 |
 | **`serde_json`** | `1.0` | JSON serialization/deserialization engine | MIT / Apache-2.0 |
 | **`toml`** | `0.8` | TOML parser and serializer for `pyproject.toml` | MIT / Apache-2.0 |

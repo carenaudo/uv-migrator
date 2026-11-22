@@ -12,14 +12,13 @@ pub struct VenvInfo {
     pub python_version_raw: String,
     pub parsed_version: Option<(u32, u32, u32)>,
     pub is_uv_managed: bool,
-    pub size_bytes: u64,
-    pub size_mb: f64,
+    pub size_bytes: Option<u64>,
     pub has_pyproject: bool,
     pub has_requirements: bool,
     pub has_setup_py: bool,
     pub has_uv_lock: bool,
     pub is_ignored: bool,
-    pub installed_packages: Vec<String>,
+    pub installed_packages: Option<Vec<String>>,
 }
 
 #[allow(dead_code)]
@@ -33,12 +32,19 @@ impl VenvInfo {
     }
 }
 
-/// Recursively scan a root directory for Python virtual environments
-pub fn scan_virtual_environments(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Inspection {
+    Quick,
+    Detailed,
+}
+
+/// Recursively scan a root directory for Python virtual environments.
+pub fn scan_with_inspection(
     root_dir: &Path,
     ignore_engine: &IgnoreEngine,
     include_all: bool,
-) -> Vec<VenvInfo> {
+    inspection: Inspection,
+) -> Result<Vec<VenvInfo>, String> {
     let mut venvs = Vec::new();
 
     let mut it = WalkDir::new(root_dir)
@@ -46,10 +52,7 @@ pub fn scan_virtual_environments(
         .into_iter();
 
     while let Some(entry_res) = it.next() {
-        let entry = match entry_res {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
+        let entry = entry_res.map_err(|error| format!("Could not scan {}: {error}", root_dir.display()))?;
 
         if !entry.file_type().is_dir() {
             continue;
@@ -76,17 +79,15 @@ pub fn scan_virtual_environments(
         if is_virtual_env_dir(dir_path) {
             let ignored = ignore_engine.is_ignored(dir_path, root_dir);
             if !ignored || include_all {
-                if let Some(info) = inspect_venv(dir_path, root_dir, ignored) {
-                    venvs.push(info);
-                }
+                venvs.push(inspect_venv(dir_path, root_dir, ignored, inspection)?);
             }
             // Do NOT descend into the virtual environment itself
             it.skip_current_dir();
         }
     }
 
-    venvs.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
-    venvs
+    venvs.sort_by(|a, b| (&a.rel_path, &a.venv_dir).cmp(&(&b.rel_path, &b.venv_dir)));
+    Ok(venvs)
 }
 
 /// Check if a directory is a virtual environment
@@ -101,7 +102,12 @@ pub fn is_virtual_env_dir(dir: &Path) -> bool {
 }
 
 /// Inspect virtual environment metadata, packages, manifests, and disk size
-pub fn inspect_venv(venv_dir: &Path, base_root: &Path, is_ignored: bool) -> Option<VenvInfo> {
+fn inspect_venv(
+    venv_dir: &Path,
+    base_root: &Path,
+    is_ignored: bool,
+    inspection: Inspection,
+) -> Result<VenvInfo, String> {
     let project_dir = venv_dir.parent().unwrap_or(venv_dir).to_path_buf();
     let rel_path = project_dir
         .strip_prefix(base_root)
@@ -111,82 +117,66 @@ pub fn inspect_venv(venv_dir: &Path, base_root: &Path, is_ignored: bool) -> Opti
 
     let mut py_ver_raw = "unknown".to_string();
     let mut is_uv = false;
-    let mut parsed_ver: Option<(u32, u32, u32)> = None;
-
-    // 1. Check pyvenv.cfg
     let pyvenv_cfg = venv_dir.join("pyvenv.cfg");
-    if pyvenv_cfg.exists() {
-        if let Ok(content) = std::fs::read_to_string(&pyvenv_cfg) {
+    match std::fs::read_to_string(&pyvenv_cfg) {
+        Ok(content) => {
             for line in content.lines() {
-                let trimmed = line.trim();
-                if trimmed.starts_with("version =") || trimmed.starts_with("version_info =") {
-                    if let Some(val) = trimmed.split('=').nth(1) {
-                        py_ver_raw = val.trim().to_string();
+                if let Some((key, value)) = line.split_once('=') {
+                    match key.trim() {
+                        "version" | "version_info" => py_ver_raw = value.trim().to_string(),
+                        "uv" => is_uv = true,
+                        _ => {}
                     }
-                }
-                if trimmed.to_lowercase().contains("uv =")
-                    || trimmed.to_lowercase().contains("virtualenv")
-                    || trimmed.contains("uv")
-                {
-                    is_uv = true;
                 }
             }
         }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("Could not read {}: {error}", pyvenv_cfg.display())),
     }
-
-    // 2. If version not parsed from pyvenv.cfg, probe binary
-    let py_bin = venv_python_path(venv_dir);
-    if py_ver_raw == "unknown" && py_bin.exists() {
-        if let Some((ver, maj, min, pat, _)) = crate::python_detector::probe_python(&py_bin) {
-            py_ver_raw = ver;
-            parsed_ver = Some((maj, min, pat));
-        }
-    } else if parsed_ver.is_none() {
-        parsed_ver = parse_version_tuple(&py_ver_raw);
-    }
-
-    // 3. Scan site-packages for installed packages via .dist-info
-    let installed_packages = scan_dist_info_packages(venv_dir);
-
-    // 4. Check manifests in project root
-    let has_pyproject = project_dir.join("pyproject.toml").exists();
-    let has_requirements = project_dir.join("requirements.txt").exists();
-    let has_setup_py = project_dir.join("setup.py").exists() || project_dir.join("setup.cfg").exists();
-    let has_uv_lock = project_dir.join("uv.lock").exists();
-
-    // 5. Measure size on disk
-    let size_bytes = dir_size_bytes(venv_dir);
-    let size_mb = (size_bytes as f64) / (1024.0 * 1024.0);
-
-    Some(VenvInfo {
+    let parsed_version = parse_version_tuple(&py_ver_raw);
+    let detailed = inspection == Inspection::Detailed;
+    let mut info = VenvInfo {
+        has_pyproject: project_dir.join("pyproject.toml").exists(),
+        has_requirements: project_dir.join("requirements.txt").exists(),
+        has_setup_py: project_dir.join("setup.py").exists() || project_dir.join("setup.cfg").exists(),
+        has_uv_lock: project_dir.join("uv.lock").exists(),
         project_dir,
         venv_dir: venv_dir.to_path_buf(),
         rel_path: if rel_path.is_empty() { ".".to_string() } else { rel_path },
         python_version_raw: py_ver_raw,
-        parsed_version: parsed_ver,
+        parsed_version,
         is_uv_managed: is_uv,
-        size_bytes,
-        size_mb,
-        has_pyproject,
-        has_requirements,
-        has_setup_py,
-        has_uv_lock,
+        size_bytes: detailed.then(|| dir_size_bytes(venv_dir)),
         is_ignored,
-        installed_packages,
-    })
+        installed_packages: detailed.then(|| scan_dist_info_packages(venv_dir)),
+    };
+    if detailed {
+        info.probe_version_if_unknown();
+    }
+    Ok(info)
+}
+
+impl VenvInfo {
+    pub fn probe_version_if_unknown(&mut self) {
+        if self.parsed_version.is_none() {
+            let python = venv_python_path(&self.venv_dir);
+            if let Some((version, major, minor, patch, _)) = crate::python_detector::probe_python(&python) {
+                self.python_version_raw = version;
+                self.parsed_version = Some((major, minor, patch));
+            }
+        }
+    }
 }
 
 fn parse_version_tuple(ver_str: &str) -> Option<(u32, u32, u32)> {
-    let clean: String = ver_str.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect();
-    let parts: Vec<&str> = clean.split('.').collect();
-    if parts.len() >= 2 {
-        let maj = parts[0].parse::<u32>().ok()?;
-        let min = parts[1].parse::<u32>().ok()?;
-        let pat = if parts.len() >= 3 { parts[2].parse::<u32>().unwrap_or(0) } else { 0 };
-        Some((maj, min, pat))
-    } else {
-        None
-    }
+    let mut parts = ver_str.trim().split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = match parts.next() {
+        Some(part) => part.split(|character: char| !character.is_ascii_digit()).next()?.parse().ok()?,
+        None => 0,
+    };
+    Some((major, minor, patch))
 }
 
 /// Extracts installed packages from .dist-info directories in site-packages

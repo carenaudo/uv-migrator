@@ -101,43 +101,17 @@ pub fn get_install_guide() -> String {
     }
 }
 
-/// Run `uv python list` to discover available and installed python runtimes
-pub fn uv_python_list(uv_path: &Path) -> Result<String, String> {
+/// Locate the managed runtime directory without initializing uv's package cache.
+pub fn uv_python_dir(uv_path: &Path) -> Option<PathBuf> {
     let output = Command::new(uv_path)
-        .args(["python", "list", "--all-versions"])
+        .args(["python", "dir"])
         .output()
-        .map_err(|e| format!("Failed to execute 'uv python list': {}", e))?;
-
-    let text = if output.status.success() {
-        String::from_utf8_lossy(&output.stdout).to_string()
-    } else {
-        // Fallback without --all-versions if older uv
-        let fallback = Command::new(uv_path)
-            .args(["python", "list"])
-            .output()
-            .map_err(|e| format!("Failed to execute 'uv python list': {}", e))?;
-        String::from_utf8_lossy(&fallback.stdout).to_string()
-    };
-
-    Ok(text)
-}
-
-/// Download/install a standalone CPython runtime cleanly via `uv python install <version>`
-/// (This NEVER alters system package managers or system files)
-pub fn uv_python_install(uv_path: &Path, version: &str) -> Result<String, String> {
-    let output = Command::new(uv_path)
-        .args(["python", "install", version])
-        .output()
-        .map_err(|e| format!("Failed to run 'uv python install {}': {}", version, e))?;
-
-    if output.status.success() {
-        let out = String::from_utf8_lossy(&output.stdout);
-        let err = String::from_utf8_lossy(&output.stderr);
-        Ok(format!("{}{}", out, err).trim().to_string())
-    } else {
-        let err = String::from_utf8_lossy(&output.stderr);
-        Err(format!("'uv python install {}' failed: {}", version, err))
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
+    let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    path.is_absolute().then_some(path)
 }
 
 /// Create a new uv-managed virtual environment at `venv_dir`, which must not exist yet.
@@ -146,20 +120,45 @@ pub fn uv_create_venv(
     venv_dir: &Path,
     python_version: &str,
     system_site_packages: bool,
+    allow_python_downloads: bool,
 ) -> Result<(), String> {
-    let mut cmd = Command::new(uv_path);
-    cmd.arg("venv").arg("--python").arg(python_version);
-    if system_site_packages {
-        cmd.arg("--system-site-packages");
-    }
-    cmd.arg(venv_dir);
-
-    let output = cmd.output().map_err(|e| format!("Failed to run 'uv venv': {}", e))?;
+    let output = venv_command(uv_path, venv_dir, python_version, system_site_packages, allow_python_downloads)
+        .output()
+        .map_err(|e| format!("Failed to run 'uv venv': {}", e))?;
     if output.status.success() {
         Ok(())
     } else {
         let err = String::from_utf8_lossy(&output.stderr);
         Err(format!("uv venv failed for Python {}: {}", python_version, err.trim()))
+    }
+}
+
+fn venv_command(uv_path: &Path, venv_dir: &Path, python_version: &str, system_site_packages: bool, allow_python_downloads: bool) -> Command {
+    let mut cmd = Command::new(uv_path);
+    cmd.arg("venv").arg("--python").arg(python_version);
+    if !allow_python_downloads {
+        cmd.arg("--no-python-downloads");
+    }
+    if system_site_packages {
+        cmd.arg("--system-site-packages");
+    }
+    cmd.arg(venv_dir);
+    cmd
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn downloads_can_be_disabled_during_venv_creation() {
+        let command = venv_command(Path::new("uv"), Path::new("venv"), "3.12", true, false);
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["venv", "--python", "3.12", "--no-python-downloads", "--system-site-packages", "venv"]
+        );
+        let command = venv_command(Path::new("uv"), Path::new("venv"), "3.12", false, true);
+        assert_eq!(command.get_args().collect::<Vec<_>>(), ["venv", "--python", "3.12", "venv"]);
     }
 }
 

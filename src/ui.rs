@@ -1,112 +1,70 @@
-use std::path::Path;
-use colored::Colorize;
-use crate::migrator::{MigrationOptions, MigrationResult};
-use crate::platform::{format_bytes, format_mb};
+use crate::migrator::MigrationResult;
+use crate::platform::format_bytes;
 use crate::python_detector::PythonRuntime;
-use crate::uv::UvInfo;
 use crate::venv_detector::VenvInfo;
 
-pub fn print_banner() {
-    println!("{}", "================================================================================".cyan());
-    println!("{}", "               ⚡ uv-migrator - Python Virtual Environment Migrator ⚡           ".bold().cyan());
-    println!("{}", "================================================================================".cyan());
-}
-
-pub fn print_uv_status(uv: Option<&UvInfo>) {
-    match uv {
-        Some(info) => {
-            println!("  {} Found uv: {} ({})", "✔".green().bold(), info.version.bold().green(), info.path.display().to_string().dimmed());
-        }
-        None => {
-            println!("  {} uv was NOT found on PATH or standard directories.", "✖".red().bold());
-            println!("\n{}", crate::uv::get_install_guide().yellow());
-        }
-    }
-}
-
 pub fn print_pythons_table(pythons: &[PythonRuntime]) {
-    println!("\n{}", "--- Detected Python Runtimes ---".bold());
     if pythons.is_empty() {
-        println!("  {}", "No Python runtimes detected.".yellow());
+        println!("No Python runtimes found.");
         return;
     }
 
-    println!("{:<14} {:<10} {:<12} {:<10} {}", "Version", "Major.Minor", "Kind", "Arch", "Path");
-    println!("{:-<14} {:-<10} {:-<12} {:-<10} {:-<30}", "", "", "", "", "");
-
-    for p in pythons {
-        let ver_str = if p.is_default {
-            format!("{} *", p.version).green().bold().to_string()
-        } else {
-            p.version.clone()
-        };
-        let mm = format!("{}.{}", p.major, p.minor);
-        let kind_str = format!("{}", p.kind);
-        println!("{:<23} {:<10} {:<12} {:<10} {}", ver_str, mm, kind_str, p.architecture, p.path.display().to_string().dimmed());
+    println!("{:<14} {:<16} {:<10} Path", "Version", "Kind", "Arch");
+    for runtime in pythons {
+        let default = if runtime.is_default { " *" } else { "" };
+        println!(
+            "{:<14} {:<16} {:<10} {}",
+            format!("{}{default}", runtime.version),
+            runtime.kind.to_string(),
+            runtime.architecture,
+            runtime.path.display()
+        );
     }
-    println!("  (* = default system python)");
+    println!("* Default system Python");
 }
 
 pub fn print_venv_table(venvs: &[VenvInfo]) {
-    println!("\n{}", "--- Discovered Virtual Environments ---".bold());
     if venvs.is_empty() {
-        println!("  {}", "No virtual environments found in search path.".yellow());
+        println!("No virtual environments found.");
         return;
     }
 
-    println!("{:<38} {:<12} {:<10} {:<12} {:<16} {}", "Project Path", "Python", "Engine", "Size", "Manifests", "Status");
-    println!("{:-<38} {:-<12} {:-<10} {:-<12} {:-<16} {:-<10}", "", "", "", "", "", "");
-
-    let mut total_size_mb = 0.0;
-    let mut total_legacy = 0;
-
-    for v in venvs {
-        total_size_mb += v.size_mb;
-        let engine = if v.is_uv_managed { "uv".green().to_string() } else {
-            total_legacy += 1;
-            "legacy".yellow().to_string()
-        };
-
-        let mut manifests = Vec::new();
-        if v.has_pyproject { manifests.push("pyproject"); }
-        if v.has_requirements { manifests.push("req.txt"); }
-        if v.has_uv_lock { manifests.push("uv.lock"); }
-        if v.has_setup_py { manifests.push("setup.py"); }
-        let manifest_str = if manifests.is_empty() { "none (auto)".dimmed().to_string() } else { manifests.join("+") };
-
-        let status = if v.is_ignored {
-            "IGNORED (Do Not Touch)".yellow().to_string()
-        } else if v.is_uv_managed {
-            "Ready (uv)".green().to_string()
-        } else {
-            "Migratable".cyan().bold().to_string()
-        };
-
-        let trunc_path = if v.rel_path.len() > 36 {
-            format!("...{}", &v.rel_path[v.rel_path.len() - 33..])
-        } else {
-            v.rel_path.clone()
-        };
-
-        println!(
-            "{:<38} {:<12} {:<10} {:<12} {:<16} {}",
-            trunc_path,
-            v.python_version_raw,
-            engine,
-            format_mb(v.size_mb),
-            manifest_str,
-            status
-        );
-    }
-
-    println!("{:-<105}", "");
     println!(
-        "Total: {} environments ({} legacy venv, {} uv) | Total disk footprint: {}",
-        venvs.len(),
-        total_legacy,
-        venvs.len() - total_legacy,
-        format_mb(total_size_mb).bold()
+        "{:<12} {:<8} {:<12} {:<12} {:<12} Path",
+        "Python", "Engine", "Status", "Size", "Packages"
     );
+    for venv in venvs {
+        let engine = if venv.is_uv_managed { "uv" } else { "legacy" };
+        let status = if venv.is_ignored { "ignored" } else { "active" };
+        println!(
+            "{:<12} {:<8} {:<12} {:<12} {:<12} {}",
+            venv.python_version_raw,
+            engine,
+            status,
+            measured_size(venv.size_bytes),
+            measured_count(venv.installed_packages.as_ref().map(Vec::len)),
+            venv.venv_dir.display()
+        );
+        if let Some(packages) = venv
+            .installed_packages
+            .as_ref()
+            .filter(|packages| !packages.is_empty())
+        {
+            println!("  {}", packages.join(", "));
+        }
+        let manifests: Vec<_> = [
+            (venv.has_pyproject, "pyproject.toml"),
+            (venv.has_requirements, "requirements.txt"),
+            (venv.has_setup_py, "setup.py/setup.cfg"),
+            (venv.has_uv_lock, "uv.lock"),
+        ]
+        .into_iter()
+        .filter_map(|(exists, name)| exists.then_some(name))
+        .collect();
+        if !manifests.is_empty() {
+            println!("  Manifests: {}", manifests.join(", "));
+        }
+    }
 }
 
 pub fn print_migration_summary(
@@ -115,147 +73,53 @@ pub fn print_migration_summary(
     final_free_gb: Option<f64>,
     dry_run: bool,
 ) {
-    println!("\n{}", "================================================================================".cyan());
-    if dry_run {
-        println!("{}", "                     DRY-RUN MIGRATION SIMULATION REPORT                        ".bold().yellow());
-    } else {
-        println!("{}", "                         MIGRATION SUMMARY REPORT                               ".bold().green());
-    }
-    println!("{}", "================================================================================".cyan());
-
-    let mut old_total = 0u64;
-    let mut new_total = 0u64;
-    let mut success_count = 0;
-    let mut fail_count = 0;
-
-    for (i, r) in results.iter().enumerate() {
-        old_total += r.old_size_bytes;
-        new_total += r.new_size_bytes;
-
-        let status = if r.success {
-            success_count += 1;
-            "✔ OK".green().bold().to_string()
-        } else {
-            fail_count += 1;
-            "✖ FAIL".red().bold().to_string()
-        };
-
-        let note = if let Some(ref e) = r.error {
-            format!(" - {}", e.red())
-        } else if let Some(ref p) = r.snapshot_path {
-            format!(" (snapshot: {})", p.display()).dimmed().to_string()
-        } else {
-            String::new()
-        };
-
-        let new_size = if r.dry_run {
-            format!("{} pkgs to verify", r.package_count).dimmed().to_string()
-        } else if r.success {
-            format_bytes(r.new_size_bytes).green().to_string()
-        } else {
-            "-".to_string()
-        };
-
-        println!(
-            "[{:02}/{:02}] {:<32} | {} -> {} | {} -> {} | {}{}",
-            i + 1,
-            results.len(),
-            r.rel_path,
-            r.old_python_version,
-            r.new_python_version.bold().cyan(),
-            format_bytes(r.old_size_bytes),
-            new_size,
-            status,
-            note
-        );
-    }
-
-    println!("{:-<80}", "");
-    println!("Environments Processed: {} | Succeeded: {} | Failed: {}", results.len(), success_count, fail_count);
-    println!("Total Old Footprint: {}", format_bytes(old_total).yellow());
-    if dry_run {
-        println!("Total New Footprint: {}", "not measured in a dry run".dimmed());
+    if results.is_empty() {
+        println!("No eligible virtual environments found.");
         return;
     }
-    println!(
-        "Total New Footprint: {} {}",
-        format_bytes(new_total).green().bold(),
-        "(apparent size; counts files uv hardlinks from its cache in full)".dimmed()
-    );
 
-    if let (Some(init_f), Some(fin_f)) = (initial_free_gb, final_free_gb) {
-        let diff = fin_f - init_f;
-        println!("Initial Free Disk Space: {:.2} GB", init_f);
-        println!("Current Free Disk Space: {:.2} GB", fin_f);
+    if dry_run {
+        println!("Migration preview. Pass --apply to rebuild.");
+    }
+    for result in results {
+        let status = match (result.success, result.error.is_some(), dry_run) {
+            (false, _, _) => "Failed",
+            (true, true, _) => "Warning",
+            (true, false, true) => "Planned",
+            (true, false, false) => "Migrated",
+        };
         println!(
-            "Disk Space Reclaimed:    {} {}",
-            format!("{:.2} GB", diff).green().bold(),
-            "(change in free space on the volume, including uv's cache)".dimmed()
+            "{status} {} | Python {} -> {} | Size {} -> {} | Packages {}",
+            result.venv_dir.display(),
+            result.old_python_version,
+            result.new_python_version.as_deref().unwrap_or("unresolved"),
+            measured_size(result.old_size_bytes),
+            measured_size(result.new_size_bytes),
+            measured_count(result.package_count),
+        );
+        if let Some(error) = &result.error {
+            println!("  {error}");
+        }
+        if let Some(path) = &result.snapshot_path {
+            println!("  Snapshot: {}", path.display());
+        }
+    }
+
+    if !dry_run {
+        println!("Replacement sizes count hardlinked files in full.");
+    }
+    if let (Some(initial), Some(final_free)) = (initial_free_gb, final_free_gb) {
+        println!(
+            "Change in volume free space: {:+.2} GiB",
+            final_free - initial
         );
     }
 }
 
-pub fn run_interactive_wizard(
-    root_dir: &Path,
-    pythons: &[PythonRuntime],
-    venvs: &[VenvInfo],
-) -> Option<MigrationOptions> {
-    println!("\n{}", "=== Interactive Setup Wizard ===".bold().cyan());
+fn measured_size(bytes: Option<u64>) -> String {
+    bytes.map_or_else(|| "unmeasured".to_string(), format_bytes)
+}
 
-    // 1. Ask if user wants to generate .uv-migrator-ignore
-    let ignore_file = root_dir.join(crate::ignore::DEFAULT_IGNORE_FILENAME);
-    if !ignore_file.exists() {
-        let create_ignore = inquire::Confirm::new("Create default 'Do Not Touch' ignore list (.uv-migrator-ignore)?")
-            .with_default(true)
-            .with_help_message("Automatically protects sensitive folders like Conda environments, .git, and node_modules")
-            .prompt()
-            .unwrap_or(true);
-
-        if create_ignore {
-            if let Ok(p) = crate::ignore::generate_default_ignore_file(root_dir, pythons) {
-                println!("  {} Created ignore configuration at {}", "✔".green(), p.display());
-            }
-        }
-    }
-
-    // 2. Python version upgrade preference
-    let upgrade_choices = vec![
-        "Match major.minor version of each virtualenv (e.g. 3.12 -> 3.12, 3.14 -> 3.14)",
-        "Upgrade to the latest MINOR version of current major (e.g. 3.12.3 -> 3.12.14)",
-        "Upgrade ALL environments to newest available Python overall (e.g. 3.14)",
-        "Dry run simulation only (preview changes without modifying disk)",
-    ];
-
-    let selection = inquire::Select::new("Choose migration & Python upgrade strategy:", upgrade_choices)
-        .prompt()
-        .ok()?;
-
-    let mut options = MigrationOptions {
-        dry_run: false,
-        upgrade_minor: false,
-        upgrade_latest: false,
-        target_python_override: None,
-        auto_install_python: true,
-    };
-
-    if selection.contains("latest MINOR") {
-        options.upgrade_minor = true;
-    } else if selection.contains("newest available") {
-        options.upgrade_latest = true;
-    } else if selection.contains("Dry run") {
-        options.dry_run = true;
-    }
-
-    let migratable_count = venvs.iter().filter(|v| !v.is_ignored).count();
-    let proceed = inquire::Confirm::new(&format!("Proceed with migration for {} environments?", migratable_count))
-        .with_default(true)
-        .prompt()
-        .unwrap_or(false);
-
-    if proceed {
-        Some(options)
-    } else {
-        println!("{}", "Migration cancelled by user.".yellow());
-        None
-    }
+fn measured_count(count: Option<usize>) -> String {
+    count.map_or_else(|| "unmeasured".to_string(), |count| count.to_string())
 }

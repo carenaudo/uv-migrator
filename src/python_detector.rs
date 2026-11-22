@@ -79,7 +79,7 @@ pub fn probe_python(python_exe: &Path) -> Option<(String, u32, u32, u32, String)
     }
 
     let output = Command::new(python_exe)
-        .arg("-c")
+        .args(["-I", "-B", "-S", "-c"])
         .arg("import sys, platform; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}|{sys.version_info.major}|{sys.version_info.minor}|{sys.version_info.micro}|{platform.machine()}')")
         .output()
         .ok()?;
@@ -108,10 +108,8 @@ pub fn discover_all_pythons(uv_info: Option<&UvInfo>) -> Vec<PythonRuntime> {
     let mut seen_paths: HashSet<PathBuf> = HashSet::new();
 
     // 1. Check uv-managed pythons if uv is available
-    if let Some(uv) = uv_info {
-        if let Ok(output) = crate::uv::uv_python_list(&uv.path) {
-            parse_uv_python_list_output(&output, &mut runtimes, &mut seen_paths);
-        }
+    if let Some(root) = uv_info.and_then(|uv| crate::uv::uv_python_dir(&uv.path)) {
+        scan_uv_managed(&root, &mut runtimes, &mut seen_paths);
     }
 
     // 2. Check Windows py launcher if on Windows
@@ -188,34 +186,16 @@ pub fn discover_all_pythons(uv_info: Option<&UvInfo>) -> Vec<PythonRuntime> {
     runtimes
 }
 
-fn parse_uv_python_list_output(output: &str, runtimes: &mut Vec<PythonRuntime>, seen_paths: &mut HashSet<PathBuf>) {
-    for line in output.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        // Output lines like:
-        // cpython-3.14.7-windows-x86_64-none   <path>
-        // cpython-3.12.14-windows-x86_64-none  <path>
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() >= 2 {
-            let candidate = PathBuf::from(parts[parts.len() - 1]);
-            let canon = candidate.canonicalize().unwrap_or_else(|_| candidate.clone());
-            if !seen_paths.contains(&canon) && candidate.exists() {
-                let kind = if parts[0].contains("cpython-") && (line.contains("uv") || line.contains("standalone")) {
-                    PythonKind::UvManaged
-                } else if line.contains("conda") {
-                    PythonKind::Conda
-                } else {
-                    PythonKind::System
-                };
-
-                if let Some(rt) = PythonRuntime::new(candidate, kind, false) {
-                    seen_paths.insert(canon);
-                    runtimes.push(rt);
-                }
-            }
+fn scan_uv_managed(root: &Path, runtimes: &mut Vec<PythonRuntime>, seen_paths: &mut HashSet<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else { return };
+    let executable = if is_windows() { "python.exe" } else { "bin/python3" };
+    for entry in entries.flatten() {
+        let install = entry.path();
+        if let Some(python) = [install.join(executable), install.join("install").join(executable)]
+            .into_iter()
+            .find(|path| path.is_file())
+        {
+            check_and_add_runtime(python, PythonKind::UvManaged, runtimes, seen_paths);
         }
     }
 }

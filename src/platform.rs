@@ -86,29 +86,40 @@ pub fn venv_python_path(venv_root: &Path) -> PathBuf {
 
 /// Get the expected site-packages path pattern inside a virtual environment directory
 pub fn find_site_packages_dirs(venv_root: &Path) -> Vec<PathBuf> {
+    try_find_site_packages_dirs(venv_root).unwrap_or_default()
+}
+
+pub fn try_find_site_packages_dirs(venv_root: &Path) -> Result<Vec<PathBuf>, String> {
     let mut results = Vec::new();
     if is_windows() {
-        let sp = venv_root.join("Lib").join("site-packages");
-        if sp.exists() {
-            results.push(sp);
-        }
+        add_site_packages(&venv_root.join("Lib"), &mut results)?;
     } else {
         let lib_dir = venv_root.join("lib");
-        if lib_dir.exists() {
-            if let Ok(entries) = std::fs::read_dir(&lib_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_dir() {
-                        let sp = path.join("site-packages");
-                        if sp.exists() {
-                            results.push(sp);
-                        }
-                    }
-                }
+        let entries = std::fs::read_dir(&lib_dir)
+            .map_err(|error| format!("Could not list {}: {error}", lib_dir.display()))?;
+        for entry in entries {
+            let path = entry
+                .map_err(|error| format!("Could not read an entry in {}: {error}", lib_dir.display()))?
+                .path();
+            let metadata = std::fs::metadata(&path)
+                .map_err(|error| format!("Could not inspect {}: {error}", path.display()))?;
+            if metadata.is_dir() {
+                add_site_packages(&path, &mut results)?;
             }
         }
     }
-    results
+    Ok(results)
+}
+
+fn add_site_packages(parent: &Path, results: &mut Vec<PathBuf>) -> Result<(), String> {
+    let path = parent.join("site-packages");
+    match std::fs::metadata(&path) {
+        Ok(metadata) if metadata.is_dir() => results.push(path),
+        Ok(_) => return Err(format!("{} is not a directory", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("Could not inspect {}: {error}", path.display())),
+    }
+    Ok(())
 }
 
 /// Calculate directory size in bytes recursively

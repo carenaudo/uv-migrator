@@ -4,6 +4,25 @@ use crate::python_detector::{PythonKind, PythonRuntime};
 
 pub const DEFAULT_IGNORE_FILENAME: &str = ".uv-migrator-ignore";
 
+pub(crate) fn conda_ignore_rules(detected_pythons: &[PythonRuntime]) -> Vec<String> {
+    let mut rules: Vec<_> = ["miniconda3", "anaconda3", "miniforge3"].into_iter().map(str::to_string).collect();
+    for runtime in detected_pythons.iter().filter(|runtime| runtime.kind == PythonKind::Conda) {
+        let prefix = runtime.path.parent().map(|parent| {
+            if parent.file_name().is_some_and(|name| name == "bin") {
+                parent.parent().unwrap_or(parent)
+            } else {
+                parent
+            }
+        });
+        if let Some(name) = prefix.and_then(Path::file_name).and_then(|name| name.to_str()) {
+            rules.push(globset::escape(name));
+        }
+    }
+    rules.sort();
+    rules.dedup();
+    rules.into_iter().map(|name| format!("**/{name}/**")).collect()
+}
+
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
 pub struct IgnoreEngine {
@@ -14,8 +33,16 @@ pub struct IgnoreEngine {
 #[allow(dead_code)]
 impl IgnoreEngine {
     pub fn new(patterns: Vec<String>) -> Result<Self, String> {
+        Self::compile(patterns.into_iter().map(|pattern| {
+            let source = format!("pattern {pattern:?}");
+            (pattern, source)
+        }))
+    }
+
+    fn compile(patterns: impl IntoIterator<Item = (String, String)>) -> Result<Self, String> {
         let mut builder = GlobSetBuilder::new();
-        for pat in &patterns {
+        let mut loaded = Vec::new();
+        for (pat, source) in patterns {
             let pat_str = pat.trim();
             if pat_str.is_empty() || pat_str.starts_with('#') {
                 continue;
@@ -23,7 +50,7 @@ impl IgnoreEngine {
             // Normalize slashes for cross-platform matching
             let normalized = pat_str.replace('\\', "/");
             let glob = Glob::new(&normalized)
-                .map_err(|e| format!("Invalid ignore glob pattern '{}': {}", pat_str, e))?;
+                .map_err(|e| format!("Invalid ignore glob {pat_str:?} in {source}: {e}"))?;
             builder.add(glob);
 
             // If pattern ends with /**, also match the directory itself without /**
@@ -38,64 +65,55 @@ impl IgnoreEngine {
                     builder.add(g);
                 }
             }
+            loaded.push(pat);
         }
 
         let glob_set = builder.build().map_err(|e| format!("Failed to build GlobSet: {}", e))?;
-        Ok(Self { glob_set, patterns })
+        Ok(Self { glob_set, patterns: loaded })
     }
 
-    /// Load ignore engine from optional ignore file path or search default in root_dir / working dir
-    pub fn load(root_dir: &Path, custom_file: Option<&Path>, cli_excludes: &[String]) -> Self {
-        let mut patterns = Vec::new();
-
-        // Standard sensible default ignores (node_modules, .git, target, etc.)
-        patterns.push("**/.git/**".to_string());
-        patterns.push("**/node_modules/**".to_string());
-        patterns.push("**/target/**".to_string());
-        patterns.push("**/.cargo/**".to_string());
-        patterns.push("**/.rustup/**".to_string());
-        patterns.push("**/.cache/**".to_string());
-        patterns.push("**/__pycache__/**".to_string());
-
-        // 1. Check custom ignore file if specified
-        if let Some(path) = custom_file {
-            if path.exists() {
-                if let Ok(content) = std::fs::read_to_string(path) {
-                    for line in content.lines() {
-                        patterns.push(line.trim().to_string());
-                    }
-                }
-            }
+    /// Load defaults and the chosen ignore file, then apply additional CLI exclusions.
+    pub fn load(root_dir: &Path, custom_file: Option<&Path>, cli_excludes: &[String]) -> Result<Self, String> {
+        let file = if let Some(path) = custom_file {
+            Some((path.to_path_buf(), Self::read_file(path)?))
         } else {
-            // 2. Check .uv-migrator-ignore in root_dir or current working directory
-            let root_ignore = root_dir.join(DEFAULT_IGNORE_FILENAME);
-            if root_ignore.exists() {
-                if let Ok(content) = std::fs::read_to_string(&root_ignore) {
-                    for line in content.lines() {
-                        patterns.push(line.trim().to_string());
-                    }
-                }
-            } else if let Ok(cwd) = std::env::current_dir() {
-                let cwd_ignore = cwd.join(DEFAULT_IGNORE_FILENAME);
-                if cwd_ignore.exists() {
-                    if let Ok(content) = std::fs::read_to_string(&cwd_ignore) {
-                        for line in content.lines() {
-                            patterns.push(line.trim().to_string());
-                        }
-                    }
-                }
+            Self::read_default(root_dir)?
+        };
+        Self::from_sources(file.as_ref().map(|(path, text)| (path.as_path(), text.as_str())), cli_excludes)
+    }
+
+    pub fn read_default(root_dir: &Path) -> Result<Option<(PathBuf, String)>, String> {
+        let root_file = root_dir.join(DEFAULT_IGNORE_FILENAME);
+        let cwd_file = std::env::current_dir().ok().map(|cwd| cwd.join(DEFAULT_IGNORE_FILENAME));
+        for path in std::iter::once(root_file).chain(cwd_file) {
+            match std::fs::read_to_string(&path) {
+                Ok(text) => return Ok(Some((path, text))),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("Could not read ignore file {}: {error}", path.display())),
             }
         }
+        Ok(None)
+    }
 
-        // 3. Add CLI excludes
-        for exc in cli_excludes {
-            patterns.push(exc.clone());
-        }
+    fn read_file(path: &Path) -> Result<String, String> {
+        std::fs::read_to_string(path).map_err(|error| format!("Could not read ignore file {}: {error}", path.display()))
+    }
 
-        Self::new(patterns).unwrap_or_else(|_| Self {
-            glob_set: GlobSetBuilder::new().build().unwrap(),
-            patterns: Vec::new(),
-        })
+    pub fn from_text(path: &Path, text: &str) -> Result<Self, String> {
+        Self::from_sources(Some((path, text)), &[])
+    }
+
+    fn from_sources(file: Option<(&Path, &str)>, cli_excludes: &[String]) -> Result<Self, String> {
+        let defaults = [".git", "node_modules", "target", ".cargo", ".rustup", ".cache", "__pycache__"]
+            .into_iter()
+            .map(|name| (format!("**/{name}/**"), "built-in rules".to_string()));
+        let lines = file.into_iter().flat_map(|(path, text)| {
+            text.lines().enumerate().map(move |(index, line)| {
+                (line.to_string(), format!("{}:{}", path.display(), index + 1))
+            })
+        });
+        let excludes = cli_excludes.iter().map(|pattern| (pattern.clone(), "--exclude".to_string()));
+        Self::compile(defaults.chain(lines).chain(excludes))
     }
 
     /// Check if a path should be ignored / skipped ("Do Not Touch")
@@ -154,18 +172,11 @@ pub fn generate_default_ignore_file(
     content.push_str("**/__pycache__/**\n\n");
 
     content.push_str("# --- Conda / Mamba Environments (Protected by default) ---\n");
-    for py in detected_pythons {
-        if matches!(py.kind, PythonKind::Conda) {
-            if let Some(parent) = py.path.parent() {
-                let env_name = parent.file_name().unwrap_or_default().to_string_lossy();
-                content.push_str(&format!("# Conda env: {}\n", py.path.display()));
-                content.push_str(&format!("**/{env_name}/**\n"));
-            }
-        }
+    for rule in conda_ignore_rules(detected_pythons) {
+        content.push_str(&rule);
+        content.push('\n');
     }
-    content.push_str("**/miniconda3/**\n");
-    content.push_str("**/anaconda3/**\n");
-    content.push_str("**/miniforge3/**\n\n");
+    content.push('\n');
 
     content.push_str("# --- Custom Do-Not-Touch Folders ---\n");
     content.push_str("# Add any legacy project folders or environments you want untouched:\n");
@@ -173,6 +184,7 @@ pub fn generate_default_ignore_file(
     content.push_str("# **/do_not_touch/**\n");
     content.push_str("# **/third_party/**\n");
 
+    IgnoreEngine::from_text(&out_path, &content)?;
     std::fs::write(&out_path, content)
         .map_err(|e| format!("Failed to create ignore file at {:?}: {}", out_path, e))?;
 
