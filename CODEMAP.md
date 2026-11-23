@@ -37,11 +37,13 @@ flowchart LR
 | Ignore rules and editor | [src/ignore.rs](src/ignore.rs), [src/gui/app.rs](src/gui/app.rs) | `IgnoreEngine::load` combines defaults, an explicit file or root/working-directory file, and CLI excludes. Invalid or unreadable rules propagate an error. The GUI validates edits before writing and requires a successful scan of the current input. |
 | Python selection and downloads | [src/migrator.rs](src/migrator.rs), [src/python_detector.rs](src/python_detector.rs), [src/uv.rs](src/uv.rs) | `PythonPolicy` implements `same`, `latest-patch`, `latest`, and numeric overrides. The two installed-runtime policies discover candidates as needed. uv-managed discovery reads the directory reported by `uv python dir`. `uv venv` handles runtime downloads and accepts `--no-python-downloads`. |
 | Package inventory and verification | [src/snapshot.rs](src/snapshot.rs), [src/platform.rs](src/platform.rs) | `read_installed` requires readable local site-packages and package metadata. It supports a usable filename fallback when `METADATA` is absent. `render` writes requirements with direct-source information. `diff` checks expected names and versions and accepts extra distributions. Scan package lists come from a separate filename reader. |
-| GUI selection and worker events | [src/gui/app.rs](src/gui/app.rs) | `start_background_scan` tags each job with a generation and captures the root and ignore inputs. `poll_events` applies only matching results. Selection uses the full venv path. `start_migration` checks scan readiness and allows one active job per GUI instance. |
+| GUI selection and worker events | [src/gui/app.rs](src/gui/app.rs) | Startup checks uv and its cache directory. The user chooses a root and starts the first scan. `start_background_scan` captures the root and ignore inputs and tags each job with a generation. `poll_events` refreshes both result lists only for matching jobs. Selection uses the full venv path. `start_migration` checks scan readiness and allows one active job per GUI instance. |
 
 ## Migration lifecycle
 
 The CLI defaults to a preview and the GUI exposes a dry-run toggle. A quick preview leaves size and package count unset. A detailed preview reads the same strict inventory used in apply. Apply jobs process environments sequentially.
+
+With force reinstall enabled, `prepare_migration_cache` builds and verifies a temporary environment for each nonempty inventory before the normal rebuild loop starts. The temporary environments use uv's configured cache and are removed after preparation. A preparation failure prevents the batch from entering the rebuild loop.
 
 ```mermaid
 flowchart TD

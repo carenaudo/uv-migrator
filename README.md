@@ -84,8 +84,8 @@ uv-migrator-gui
 ```
 
 ### The 4-Step Guided Workflow:
-1. **Startup Guard**: Checks if `uv` is detected and displays an active status badge or setup helper.
-2. **Step 1: Select & Scan**: Pick any root project directory via native OS folder picker (`rfd`), discovering environments and available Python runtimes.
+1. **Startup Guard**: Checks for `uv` and shows its version and cache directory or the setup helper.
+2. **Step 1: Select & Scan**: Browse for a folder or enter its path, then select **Scan**. Each scan refreshes the virtual environments and Python installations shown on this screen.
 3. **Step 2: Review & Configure Ignores**: Toggle individual environments and select **Save** after editing `.uv-migrator-ignore` rules with preset templates.
 4. **Step 3: Upgrade Strategy**: Choose your desired Python upgrade policy and toggle **Dry-Run Mode** if you wish to simulate first.
 5. **Step 4: Live Migration & Monitor**: Watch the live progress bar, activity logs, and see your total disk space reclaimed in real time.
@@ -104,10 +104,12 @@ uv-migrator init ./projects
 uv-migrator migrate ./projects
 uv-migrator migrate ./projects --details --python latest-patch
 uv-migrator migrate ./projects --apply --python 3.12 --no-python-downloads
+uv-migrator migrate ./projects --apply --force-reinstall
 ```
 
 - **Scan.** The default reads virtual-environment paths, configuration, and manifest presence. Add `--details` to measure sizes, list local packages, and probe unresolved interpreter versions.
 - **Preview and apply.** `migrate` previews legacy environments by default. Add `--apply` to rebuild or `--include-uv` to include environments created by uv. `--details` is available during preview. It adds installed-package counts, measured size, and probes unresolved versions. An apply requires uv when there are eligible environments.
+- **Force reinstall.** `--apply --force-reinstall` includes existing uv environments. First it prepares and verifies the selected packages in disposable environments using uv's configured persistent cache. Rebuilds start only after preparation succeeds for the batch. The GUI offers the same option under **Upgrade Strategy**.
 - **Python selection.** `--python same` keeps the current major.minor series. `latest-patch` chooses the highest installed patch in that series. `latest` chooses the newest detected major.minor. You can also pass a numeric version such as `3.12.4`. Use `--no-python-downloads` with `--apply` to require an installed interpreter.
 - **Ignore rules.** `scan` and `migrate` accept `--ignore-file FILE` and repeatable `--exclude GLOB`. Invalid rules stop the command before migration. `scan --include-ignored` includes environments matched by ignore rules. Only `init --force` overwrites an existing ignore file from the CLI.
 - **Script output.** `--format json` produces one result with `null` for unmeasured fields. An operational error before results are available produces an object with an `error` field. Command exit codes are `0` for success or no matches, `1` for operational or per-environment failures, and `2` for invalid arguments.

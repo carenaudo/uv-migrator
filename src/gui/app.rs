@@ -3,10 +3,10 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use eframe::egui::{self, Color32, RichText};
 use crate::ignore::{conda_ignore_rules, IgnoreEngine, DEFAULT_IGNORE_FILENAME};
-use crate::migrator::{migrate_environment, preview_environment, MigrationResult, PythonPolicy};
+use crate::migrator::{migrate_environment, prepare_migration_cache, preview_environment, MigrationResult, PythonPolicy};
 use crate::platform::{current_os, disk_free_space_gb, format_bytes};
 use crate::python_detector::{discover_all_pythons, PythonKind, PythonRuntime};
-use crate::uv::{find_uv, get_install_guide, UvInfo};
+use crate::uv::{find_uv, get_install_guide, uv_cache_dir, UvInfo};
 use crate::venv_detector::{scan_with_inspection, Inspection, VenvInfo};
 
 const DEFAULT_IGNORE_TEXT: &str = "# uv-migrator Do Not Touch list\n**/miniconda3/**\n**/anaconda3/**\n";
@@ -41,6 +41,8 @@ pub enum BackgroundEvent {
         rel_path: String,
         result: MigrationResult,
     },
+    CachePrepared,
+    CachePreparationFailed(String),
     MigrationComplete {
         results: Vec<MigrationResult>,
         initial_free_gb: Option<f64>,
@@ -58,6 +60,7 @@ pub struct ScanInput {
 pub struct UvMigratorApp {
     pub current_step: Step,
     pub uv_info: Option<UvInfo>,
+    uv_cache_path: Option<PathBuf>,
     pub search_path: String,
 
     // Step 1 & 2 data
@@ -75,6 +78,7 @@ pub struct UvMigratorApp {
     pub upgrade_mode: UpgradeMode,
     pub custom_python: String,
     pub dry_run: bool,
+    force_reinstall: bool,
     pub auto_install_python: bool,
 
     // Step 4 migration progress
@@ -82,6 +86,7 @@ pub struct UvMigratorApp {
     pub progress_fraction: f32,
     pub progress_text: String,
     pub migration_results: Vec<MigrationResult>,
+    cache_preparation_error: Option<String>,
     pub initial_free_gb: Option<f64>,
     pub final_free_gb: Option<f64>,
     pub activity_logs: Vec<String>,
@@ -93,23 +98,18 @@ pub struct UvMigratorApp {
 
 impl UvMigratorApp {
     pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
-        let default_path = std::env::current_dir()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| ".".to_string());
-
-        let mut app = Self::with_uv(default_path, find_uv());
-        if app.uv_info.is_some() {
-            app.scan_from_disk();
-        }
+        let mut app = Self::with_uv(None);
+        app.check_uv();
         app
     }
 
-    fn with_uv(search_path: String, uv: Option<UvInfo>) -> Self {
+    fn with_uv(uv: Option<UvInfo>) -> Self {
         let (sender, receiver) = channel();
         Self {
             current_step: if uv.is_some() { Step::Scan } else { Step::DetectUv },
             uv_info: uv,
-            search_path,
+            uv_cache_path: None,
+            search_path: String::new(),
             pythons: Vec::new(),
             venvs: Vec::new(),
             selected_venvs: HashSet::new(),
@@ -122,11 +122,13 @@ impl UvMigratorApp {
             upgrade_mode: UpgradeMode::LatestPatch,
             custom_python: "3.14".to_string(),
             dry_run: false,
+            force_reinstall: false,
             auto_install_python: true,
             is_migrating: false,
             progress_fraction: 0.0,
             progress_text: "Ready to start".to_string(),
             migration_results: Vec::new(),
+            cache_preparation_error: None,
             initial_free_gb: None,
             final_free_gb: None,
             activity_logs: Vec::new(),
@@ -137,14 +139,14 @@ impl UvMigratorApp {
 
     pub fn check_uv(&mut self) {
         self.uv_info = find_uv();
+        self.uv_cache_path = self.uv_info.as_ref().and_then(|uv| uv_cache_dir(&uv.path));
         if self.uv_info.is_some() && self.current_step == Step::DetectUv {
             self.current_step = Step::Scan;
-            self.scan_from_disk();
         }
     }
 
     fn scan_from_disk(&mut self) {
-        if self.is_migrating {
+        if self.is_migrating || self.search_path.trim().is_empty() {
             return;
         }
         match IgnoreEngine::read_default(Path::new(&self.search_path)) {
@@ -188,7 +190,7 @@ impl UvMigratorApp {
     }
 
     pub fn start_background_scan(&mut self) {
-        if self.is_migrating {
+        if self.is_migrating || self.search_path.trim().is_empty() {
             return;
         }
         self.is_scanning = true;
@@ -269,9 +271,15 @@ impl UvMigratorApp {
         self.is_migrating = true;
         self.current_step = Step::Migrate;
         self.progress_fraction = 0.0;
-        self.progress_text = "Preparing migration...".to_string();
+        let prepare_cache = self.force_reinstall && !self.dry_run;
+        self.progress_text = if prepare_cache {
+            "Preparing packages in the uv cache..."
+        } else {
+            "Preparing migration..."
+        }.to_string();
         self.activity_logs.clear();
         self.migration_results.clear();
+        self.cache_preparation_error = None;
         self.initial_free_gb = None;
         self.final_free_gb = None;
 
@@ -283,6 +291,15 @@ impl UvMigratorApp {
 
         std::thread::spawn(move || {
             let initial_free = if dry_run { None } else { disk_free_space_gb(&root) };
+            if prepare_cache {
+                if let Err(error) = prepare_migration_cache(
+                    &venvs_to_migrate, &uv, &pythons, &policy, allow_downloads,
+                ) {
+                    let _ = tx.send(BackgroundEvent::CachePreparationFailed(error));
+                    return;
+                }
+                let _ = tx.send(BackgroundEvent::CachePrepared);
+            }
             let total = venvs_to_migrate.len();
             let mut results = Vec::new();
 
@@ -342,6 +359,14 @@ impl UvMigratorApp {
                     self.venvs = venvs;
                     self.scanned_input = Some(input);
                 }
+                BackgroundEvent::CachePrepared => {
+                    self.progress_text = "Cache preparation complete. Rebuilding environments...".to_string();
+                }
+                BackgroundEvent::CachePreparationFailed(error) => {
+                    self.is_migrating = false;
+                    self.cache_preparation_error = Some(error);
+                    self.current_step = Step::Completed;
+                }
                 BackgroundEvent::MigrationProgress { index, total, rel_path, result } => {
                     self.progress_fraction = index as f32 / total.max(1) as f32;
                     self.progress_text = format!("[{}/{}] Migrated {}", index, total, rel_path);
@@ -380,7 +405,7 @@ impl eframe::App for UvMigratorApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(ref uv) = self.uv_info {
                         ui.label(
-                            RichText::new(format!("✔ uv {}", uv.version))
+                            RichText::new(format!("✔ {}", uv.version))
                                 .color(Color32::from_rgb(50, 220, 100))
                                 .strong(),
                         );
@@ -389,6 +414,21 @@ impl eframe::App for UvMigratorApp {
                     }
                 });
             });
+            if self.uv_info.is_some() {
+                ui.horizontal(|ui| {
+                    ui.label("uv cache directory");
+                    if let Some(path) = &self.uv_cache_path {
+                        let path = path.display().to_string();
+                        if ui.small_button("Copy path").clicked() {
+                            ctx.output_mut(|output| output.copied_text = path.clone());
+                        }
+                        ui.add(egui::Label::new(RichText::new(&path).monospace()).truncate())
+                            .on_hover_text(path);
+                    } else {
+                        ui.label("Unavailable");
+                    }
+                });
+            }
             ui.add_space(6.0);
 
             // Step Navigation Tabs (if UV is available)
@@ -397,11 +437,15 @@ impl eframe::App for UvMigratorApp {
                 ui.horizontal(|ui| {
                     ui.selectable_value(&mut self.current_step, Step::Scan, "1. Select & Scan");
                     ui.label("➔");
-                    ui.selectable_value(&mut self.current_step, Step::ReviewIgnore, "2. Review & Ignore");
+                    ui.add_enabled_ui(self.scan_is_current() && !self.venvs.is_empty(), |ui| {
+                        ui.selectable_value(&mut self.current_step, Step::ReviewIgnore, "2. Review & Ignore");
+                        ui.label("➔");
+                        ui.selectable_value(&mut self.current_step, Step::UpgradeOptions, "3. Upgrade Strategy");
+                    });
                     ui.label("➔");
-                    ui.selectable_value(&mut self.current_step, Step::UpgradeOptions, "3. Upgrade Strategy");
-                    ui.label("➔");
-                    ui.selectable_value(&mut self.current_step, Step::Migrate, "4. Migration Progress");
+                    ui.add_enabled_ui(!self.migration_results.is_empty() || self.cache_preparation_error.is_some(), |ui| {
+                        ui.selectable_value(&mut self.current_step, Step::Migrate, "4. Migration Progress");
+                    });
                 });
                 ui.add_space(4.0);
             }
@@ -415,7 +459,11 @@ impl eframe::App for UvMigratorApp {
                 self.render_missing_uv_screen(ui, ctx);
             } else {
                 match self.current_step {
-                    Step::Scan => self.render_scan_step(ui),
+                    Step::Scan => {
+                        egui::ScrollArea::vertical().id_salt("scan_page").show(ui, |ui| {
+                            self.render_scan_step(ui);
+                        });
+                    }
                     Step::ReviewIgnore => self.render_ignore_step(ui),
                     Step::UpgradeOptions => self.render_upgrade_step(ui),
                     Step::Migrate | Step::Completed => self.render_migrate_step(ui),
@@ -469,28 +517,36 @@ impl UvMigratorApp {
     fn render_scan_step(&mut self, ui: &mut egui::Ui) {
         ui.add_space(10.0);
         ui.heading("Step 1: Select Folder & Scan");
-        ui.label("Select a root directory to discover virtual environments and installed Python runtimes.");
+        ui.label("Choose a folder, then scan for virtual environments and installed Python runtimes.");
         ui.add_space(10.0);
 
         // Path input + browse button
-        ui.horizontal(|ui| {
+        let scan_requested = ui.horizontal(|ui| {
             ui.label("Target Folder:");
-            let text_edit = ui.text_edit_singleline(&mut self.search_path);
-            if text_edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                self.scan_from_disk();
+            let text_edit = ui.add(egui::TextEdit::singleline(&mut self.search_path).hint_text("Choose or enter a folder"));
+            if text_edit.changed() {
+                self.scan_error = None;
             }
+            let enter = text_edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
 
             if ui.button("📁 Browse...").clicked() {
-                if let Some(folder) = rfd::FileDialog::new().set_directory(&self.search_path).pick_folder() {
+                let mut dialog = rfd::FileDialog::new();
+                if Path::new(&self.search_path).is_dir() {
+                    dialog = dialog.set_directory(&self.search_path);
+                }
+                if let Some(folder) = dialog.pick_folder() {
                     self.search_path = folder.to_string_lossy().to_string();
-                    self.scan_from_disk();
+                    self.scan_error = None;
                 }
             }
 
-            if ui.button(RichText::new("🔍 Scan").strong()).clicked() && !self.is_scanning {
-                self.scan_from_disk();
-            }
-        });
+            let ready = !self.is_scanning && !self.search_path.trim().is_empty();
+            let scan = ui.add_enabled(ready, egui::Button::new(RichText::new("🔍 Scan").strong()));
+            ready && (enter || scan.clicked())
+        }).inner;
+        if scan_requested {
+            self.scan_from_disk();
+        }
 
         ui.add_space(15.0);
 
@@ -499,7 +555,7 @@ impl UvMigratorApp {
                 ui.spinner();
                 ui.label(RichText::new("Scanning directories and discovering runtimes...").italics());
             });
-        } else {
+        } else if self.scan_is_current() {
             // Summary cards
             ui.horizontal(|ui| {
                 egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -519,11 +575,33 @@ impl UvMigratorApp {
 
             ui.add_space(15.0);
 
-            // Collapsible Python runtimes list
-            egui::CollapsingHeader::new(RichText::new(format!("Detected Python Runtimes ({})", self.pythons.len())).strong())
-                .default_open(false)
+            egui::CollapsingHeader::new(RichText::new("Virtual Environments").strong())
+                .id_salt("scan_environments")
+                .default_open(true)
                 .show(ui, |ui| {
-                    egui::ScrollArea::vertical().max_height(140.0).show(ui, |ui| {
+                    if self.venvs.is_empty() {
+                        ui.label("No virtual environments found in this folder.");
+                    }
+                    egui::ScrollArea::vertical().id_salt("scan_environment_list").max_height(140.0).show(ui, |ui| {
+                        for venv in &self.venvs {
+                            ui.horizontal(|ui| {
+                                ui.label(venv.venv_dir.display().to_string());
+                                if venv.is_ignored {
+                                    ui.label("Ignored");
+                                }
+                            });
+                        }
+                    });
+                });
+
+            egui::CollapsingHeader::new(RichText::new("Python Installations").strong())
+                .id_salt("scan_python_installations")
+                .default_open(true)
+                .show(ui, |ui| {
+                    if self.pythons.is_empty() {
+                        ui.label("No Python installations found.");
+                    }
+                    egui::ScrollArea::vertical().id_salt("scan_python_list").max_height(140.0).show(ui, |ui| {
                         for p in &self.pythons {
                             ui.horizontal(|ui| {
                                 ui.label(RichText::new(&p.version).strong());
@@ -698,6 +776,10 @@ impl UvMigratorApp {
             ui.set_max_width(700.0);
             ui.checkbox(&mut self.dry_run, RichText::new("Dry Run Mode (Simulation only, do not modify files)").strong());
             ui.checkbox(&mut self.auto_install_python, "Auto-download standalone Python via uv if target version is not installed");
+            ui.add_enabled(!self.dry_run, egui::Checkbox::new(
+                &mut self.force_reinstall,
+                "Force reinstall (prepare packages in the uv cache first)",
+            ));
         });
 
         ui.add_space(20.0);
@@ -728,6 +810,14 @@ impl UvMigratorApp {
 
     fn render_migrate_step(&mut self, ui: &mut egui::Ui) {
         ui.add_space(10.0);
+        if let Some(error) = &self.cache_preparation_error {
+            ui.heading("Cache preparation failed");
+            ui.colored_label(Color32::LIGHT_RED, error);
+            if ui.button("Back to upgrade options").clicked() {
+                self.current_step = Step::UpgradeOptions;
+            }
+            return;
+        }
         if self.is_migrating {
             ui.heading("Step 4: Migrating Virtual Environments...");
         } else {
@@ -810,7 +900,9 @@ mod tests {
     use super::*;
 
     fn app() -> UvMigratorApp {
-        UvMigratorApp::with_uv("root".into(), Some(UvInfo { path: "uv".into(), version: String::new() }))
+        let mut app = UvMigratorApp::with_uv(Some(UvInfo { path: "uv".into(), version: String::new() }));
+        app.search_path = "root".into();
+        app
     }
 
     fn environment(path: &str, ignored: bool) -> VenvInfo {
@@ -831,7 +923,11 @@ mod tests {
         }
     }
 
-    fn finish_scan(app: &mut UvMigratorApp, generation: u64, result: Result<Vec<VenvInfo>, String>) {
+    fn send_scan(
+        app: &mut UvMigratorApp,
+        generation: u64,
+        result: Result<(Vec<PythonRuntime>, Vec<VenvInfo>), String>,
+    ) {
         app.sender.send(BackgroundEvent::ScanComplete {
             generation,
             input: ScanInput {
@@ -839,9 +935,56 @@ mod tests {
                 ignore_file: app.ignore_file.clone(),
                 ignore_text: app.ignore_text.clone(),
             },
-            result: result.map(|venvs| (Vec::new(), venvs)),
+            result,
         }).unwrap();
         app.poll_events();
+    }
+
+    fn finish_scan(app: &mut UvMigratorApp, generation: u64, result: Result<Vec<VenvInfo>, String>) {
+        send_scan(app, generation, result.map(|venvs| (Vec::new(), venvs)));
+    }
+
+    #[test]
+    fn startup_waits_for_a_folder_without_scanning() {
+        let mut app = UvMigratorApp::with_uv(None);
+        app.check_uv();
+        app.scan_from_disk();
+        app.start_background_scan();
+        assert!(app.search_path.is_empty());
+        assert!(!app.is_scanning);
+        assert_eq!(app.scan_generation, 0);
+        assert!(!app.scan_is_current());
+        assert!(app.venvs.is_empty() && app.pythons.is_empty());
+    }
+
+    #[test]
+    fn new_scan_replaces_both_result_lists() {
+        let mut app = app();
+        let runtime = |name: &str| PythonRuntime {
+            version: "3.12.4".into(),
+            major: 3,
+            minor: 12,
+            patch: 4,
+            path: PathBuf::from(name),
+            kind: PythonKind::System,
+            architecture: String::new(),
+            is_default: false,
+        };
+        send_scan(&mut app, 0, Ok((vec![runtime("old-python")], vec![
+            environment("root/project/.venv", false),
+        ])));
+        assert_eq!(app.pythons[0].path, Path::new("old-python"));
+        assert_eq!(app.venvs.len(), 1);
+
+        app.search_path = "other-root".into();
+        assert!(!app.scan_is_current());
+        app.scan_generation = 1;
+        send_scan(&mut app, 1, Ok((vec![runtime("new-python")], Vec::new())));
+        assert!(app.scan_is_current());
+        assert_eq!(app.pythons.len(), 1);
+        assert_eq!(app.pythons[0].path, Path::new("new-python"));
+        assert!(app.venvs.is_empty());
+        assert!(app.selected_venvs.is_empty());
     }
 
     #[test]

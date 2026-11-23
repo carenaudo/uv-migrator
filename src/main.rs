@@ -6,7 +6,7 @@ use indicatif::ProgressBar;
 use serde_json::{json, Value};
 use uv_migrator::cli::{Cli, Commands, InitArgs, MigrateArgs, OutputFormat, ScanArgs, SearchArgs};
 use uv_migrator::ignore::{self, IgnoreEngine};
-use uv_migrator::migrator::{migrate_environment, preview_environment};
+use uv_migrator::migrator::{migrate_environment, prepare_migration_cache, preview_environment};
 use uv_migrator::platform::disk_free_space_gb;
 use uv_migrator::python_detector::discover_all_pythons;
 use uv_migrator::ui;
@@ -94,7 +94,7 @@ fn scan(args: ScanArgs) -> Result<bool, String> {
 
 fn migrate(args: MigrateArgs) -> Result<bool, String> {
     let (root, mut environments) = search(args.search, false, Inspection::Quick)?;
-    environments.retain(|venv| args.include_uv || !venv.is_uv_managed);
+    environments.retain(|venv| args.include_uv || args.force_reinstall || !venv.is_uv_managed);
 
     let applying = args.apply && !environments.is_empty();
     let needs_discovery = !environments.is_empty() && args.python.needs_discovery();
@@ -124,6 +124,19 @@ fn migrate(args: MigrateArgs) -> Result<bool, String> {
     } else {
         None
     };
+
+    if let Some(uv) = uv.as_ref().filter(|_| args.force_reinstall) {
+        if args.output.format == OutputFormat::Text {
+            eprintln!("Preparing packages in the uv cache before rebuilding...");
+        }
+        prepare_migration_cache(
+            &environments,
+            uv,
+            &pythons,
+            &args.python,
+            !args.no_python_downloads,
+        )?;
+    }
 
     let progress = (applying && args.output.format == OutputFormat::Text)
         .then(|| ProgressBar::new(environments.len() as u64));

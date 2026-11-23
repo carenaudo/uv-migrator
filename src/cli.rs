@@ -81,6 +81,9 @@ pub struct MigrateArgs {
     /// Rebuild environments after planning
     #[arg(long)]
     pub apply: bool,
+    /// Prepare packages in the shared uv cache, then rebuild legacy and uv environments
+    #[arg(long, requires = "apply")]
+    pub force_reinstall: bool,
     /// Include size and package counts and probe unresolved versions in the preview
     #[arg(long, conflicts_with = "apply")]
     pub details: bool,
@@ -141,6 +144,7 @@ mod tests {
             &["--interactive"],
             &["--apply", "--details"],
             &["--no-python-downloads"],
+            &["--force-reinstall"],
             &["--python", "3"],
         ] {
             assert!(
@@ -159,6 +163,7 @@ mod tests {
             "uv-migrator",
             "migrate",
             "--apply",
+            "--force-reinstall",
             "--no-python-downloads",
             "--python",
             "3.12.4"

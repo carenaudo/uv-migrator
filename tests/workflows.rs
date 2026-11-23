@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::Value;
 use uv_migrator::ignore::IgnoreEngine;
-use uv_migrator::migrator::{backup_path, migrate_environment, preview_environment, PythonPolicy};
+use uv_migrator::migrator::{
+    backup_path, migrate_environment, prepare_migration_cache, preview_environment, PythonPolicy,
+};
 use uv_migrator::python_detector::{PythonKind, PythonRuntime};
 use uv_migrator::snapshot::{read_installed, snapshot_path};
 use uv_migrator::uv::UvInfo;
@@ -53,6 +55,40 @@ fn packages(venv: &Path) -> PathBuf {
     } else {
         "lib/python3.12/site-packages"
     })
+}
+
+#[test]
+fn cache_preparation_leaves_the_batch_intact_on_failure() {
+    let fixture = Fixture::new();
+    let first = fixture.venv("a/.venv", "uv = 0.12\nversion = 3.12.4\n");
+    let second = fixture.venv("b/.venv", "version = 3.12.4\n");
+    fs::create_dir_all(packages(&first)).unwrap();
+    fixture.venv(
+        "a/.uv-migrator-cache-prep-orphan/.venv",
+        "version = 3.12.4\n",
+    );
+    let ignores = IgnoreEngine::new(Vec::new()).unwrap();
+    let environments =
+        scan_with_inspection(&fixture.0, &ignores, false, Inspection::Quick).unwrap();
+    assert_eq!(environments.len(), 2);
+
+    let uv = UvInfo {
+        path: fixture.0.join("unavailable"),
+        version: String::new(),
+    };
+    let error =
+        prepare_migration_cache(&environments, &uv, &[], &PythonPolicy::Same, false).unwrap_err();
+    assert_eq!(environments[1].venv_dir, second);
+    assert!(
+        error.contains(&environments[1].venv_dir.display().to_string()),
+        "{error}"
+    );
+    assert!(error.contains("Rebuilds did not start"));
+    for path in [first, second] {
+        assert!(path.join("pyvenv.cfg").is_file());
+        assert!(!snapshot_path(&path).exists());
+        assert!(!backup_path(&path).exists());
+    }
 }
 
 fn json(output: &Output) -> Value {

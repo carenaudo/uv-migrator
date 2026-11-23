@@ -103,8 +103,17 @@ pub fn get_install_guide() -> String {
 
 /// Locate the managed runtime directory without initializing uv's package cache.
 pub fn uv_python_dir(uv_path: &Path) -> Option<PathBuf> {
+    read_uv_directory(uv_path, "python")
+}
+
+/// Locate uv's effective cache directory, including overrides recognized by uv.
+pub fn uv_cache_dir(uv_path: &Path) -> Option<PathBuf> {
+    read_uv_directory(uv_path, "cache")
+}
+
+fn read_uv_directory(uv_path: &Path, command: &str) -> Option<PathBuf> {
     let output = Command::new(uv_path)
-        .args(["python", "dir"])
+        .args([command, "dir"])
         .output()
         .ok()?;
     if !output.status.success() {

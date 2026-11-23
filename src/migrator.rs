@@ -5,11 +5,12 @@ use serde::{Deserialize, Serialize};
 use crate::platform::{dir_size_bytes, venv_python_path};
 use crate::python_detector::{find_latest_minor_version, find_latest_overall_version, PythonRuntime};
 use crate::snapshot::{self, InstalledPackage};
-use crate::uv::{uv_create_venv, uv_pip_install_requirements, UvInfo};
+use crate::uv::{uv_cache_dir, uv_create_venv, uv_pip_install_requirements, UvInfo};
 use crate::venv_detector::VenvInfo;
 
 /// Suffix of the directory the old environment is moved to while its replacement is built.
 pub const BACKUP_SUFFIX: &str = ".uv-migrator-backup";
+pub(crate) const CACHE_PREP_PREFIX: &str = ".uv-migrator-cache-prep-";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PythonPolicy {
@@ -127,6 +128,62 @@ fn collect_inventory(venv: &VenvInfo, result: &mut MigrationResult) -> Result<Ve
     Ok(installed)
 }
 
+/// Populate uv's shared cache before any selected environment is moved.
+pub fn prepare_migration_cache(
+    venvs: &[VenvInfo],
+    uv: &UvInfo,
+    detected_pythons: &[PythonRuntime],
+    policy: &PythonPolicy,
+    allow_python_downloads: bool,
+) -> Result<(), String> {
+    let mut checked_cache = false;
+    for venv in venvs {
+        let mut prepare = || {
+            check_backup(&backup_path(&venv.venv_dir))?;
+            let target = determine_target_python(venv, detected_pythons, policy)
+                .ok_or("Could not determine the target Python version. Specify an explicit version.")?;
+            let installed = snapshot::read_installed(&venv.venv_dir)?;
+            if installed.is_empty() {
+                return Ok(());
+            }
+            if !checked_cache {
+                let cache = uv_cache_dir(&uv.path).ok_or("Could not resolve the uv cache directory")?;
+                // With no-cache enabled, uv reports a new temporary cache per invocation.
+                if uv_cache_dir(&uv.path).as_deref() != Some(cache.as_path()) {
+                    return Err("Force reinstall requires a persistent uv cache. Check uv's no-cache setting.".to_string());
+                }
+                checked_cache = true;
+            }
+
+            // A staging environment on the project's volume can use uv's normal hardlinks.
+            let staging = tempfile::Builder::new()
+                .prefix(CACHE_PREP_PREFIX)
+                .tempdir_in(&venv.project_dir)
+                .map_err(|error| format!("Could not create a temporary directory: {error}"))?;
+            let requirements = staging.path().join("requirements.txt");
+            let snapshot = snapshot::render(&installed, &venv.venv_dir, &venv.python_version_raw);
+            std::fs::write(&requirements, snapshot)
+                .map_err(|error| format!("Could not write temporary requirements: {error}"))?;
+            build_and_verify(
+                uv,
+                &staging.path().join(".venv"),
+                &target,
+                uses_system_site_packages(&venv.venv_dir),
+                allow_python_downloads,
+                &requirements,
+                &installed,
+            )?;
+            staging.close()
+                .map_err(|error| format!("Could not remove the temporary environment: {error}"))
+        };
+        prepare().map_err(|error| format!(
+            "Cache preparation failed for {}: {error}. Rebuilds did not start.",
+            venv.venv_dir.display()
+        ))?;
+    }
+    Ok(())
+}
+
 /// Replace one environment and restore its backup on a rebuild failure:
 ///
 /// 1. snapshot every installed package, with its source, to a sidecar file;
@@ -152,19 +209,9 @@ pub fn migrate_environment(
             return result;
         }
     };
-    match std::fs::symlink_metadata(&backup) {
-        Ok(_) => {
-            result.error = Some(format!(
-                "A backup from an earlier run exists at {}. Restore or remove it first.",
-                backup.display()
-            ));
-            return result;
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => {
-            result.error = Some(format!("Could not check {}: {error}", backup.display()));
-            return result;
-        }
+    if let Err(error) = check_backup(&backup) {
+        result.error = Some(error);
+        return result;
     }
 
     let installed = match collect_inventory(venv, &mut result) {
@@ -193,8 +240,8 @@ pub fn migrate_environment(
     // 3-4. Build and verify. 5. Delete the old one only on success.
     let system_site = uses_system_site_packages(&backup);
     match build_and_verify(uv, &venv.venv_dir, &target_python, system_site, allow_python_downloads, &snap_path, &installed) {
-        Ok(new_size) => {
-            result.new_size_bytes = Some(new_size);
+        Ok(()) => {
+            result.new_size_bytes = Some(dir_size_bytes(&venv.venv_dir));
             result.success = true;
             if let Err(e) = safe_remove_dir_all(&backup) {
                 result.error = Some(format!("Migrated, but the old environment could not be deleted and is still at {}: {}", backup.display(), e));
@@ -226,7 +273,7 @@ fn build_and_verify(
     allow_python_downloads: bool,
     snap_path: &Path,
     before: &[InstalledPackage],
-) -> Result<u64, String> {
+) -> Result<(), String> {
     uv_create_venv(&uv.path, venv_dir, target_python, system_site_packages, allow_python_downloads)?;
     let py = venv_python_path(venv_dir);
     if !py.exists() {
@@ -240,7 +287,18 @@ fn build_and_verify(
     if !problems.is_empty() {
         return Err(format!("New environment does not match the old one: {}", problems.join("; ")));
     }
-    Ok(dir_size_bytes(venv_dir))
+    Ok(())
+}
+
+fn check_backup(backup: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(backup) {
+        Ok(_) => Err(format!(
+            "A backup from an earlier run exists at {}. Restore or remove it first.",
+            backup.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("Could not check {}: {error}", backup.display())),
+    }
 }
 
 pub fn backup_path(venv_dir: &Path) -> PathBuf {
