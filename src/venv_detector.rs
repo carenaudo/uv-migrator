@@ -58,22 +58,12 @@ pub fn scan_with_inspection(
             continue;
         }
 
-        let file_name = entry.file_name().to_string_lossy();
-        // Skip common build / VCS / non-project directories without descending
-        if file_name == ".git"
-            || file_name == "node_modules"
-            || file_name == "target"
-            || file_name == ".cargo"
-            || file_name == "__pycache__"
-            || file_name == ".idea"
-            || file_name == ".vscode"
-            || file_name == ".pytest_cache"
-            || file_name == ".mypy_cache"
-            || file_name.ends_with(crate::migrator::BACKUP_SUFFIX)
-            || file_name.starts_with(crate::migrator::CACHE_PREP_PREFIX)
-        {
-            it.skip_current_dir();
-            continue;
+        if entry.depth() > 0 {
+            let file_name = entry.file_name().to_string_lossy();
+            if should_skip_dir(&file_name) {
+                it.skip_current_dir();
+                continue;
+            }
         }
 
         let dir_path = entry.path();
@@ -89,6 +79,59 @@ pub fn scan_with_inspection(
 
     venvs.sort_by(|a, b| (&a.rel_path, &a.venv_dir).cmp(&(&b.rel_path, &b.venv_dir)));
     Ok(venvs)
+}
+
+fn should_skip_dir(file_name: &str) -> bool {
+    if file_name.ends_with(crate::migrator::BACKUP_SUFFIX)
+        || file_name.starts_with(crate::migrator::CACHE_PREP_PREFIX)
+    {
+        return true;
+    }
+
+    if matches!(
+        file_name,
+        ".git"
+            | ".hg"
+            | ".svn"
+            | ".cargo"
+            | ".rustup"
+            | ".cache"
+            | ".npm"
+            | ".nuget"
+            | ".gradle"
+            | ".m2"
+            | ".idea"
+            | ".vscode"
+            | ".pytest_cache"
+            | ".mypy_cache"
+            | ".tox"
+            | ".nox"
+            | "node_modules"
+            | "target"
+            | "__pycache__"
+            | "dist"
+            | "build"
+            | "Library"
+            | "System"
+            | "proc"
+            | "sys"
+            | "dev"
+            | "run"
+    ) {
+        return true;
+    }
+
+    matches!(
+        file_name.to_ascii_lowercase().as_str(),
+        "windows"
+            | "program files"
+            | "program files (x86)"
+            | "programdata"
+            | "appdata"
+            | "$recycle.bin"
+            | "system volume information"
+            | "recovery"
+    )
 }
 
 /// Check if a directory is a virtual environment
@@ -221,6 +264,26 @@ mod tests {
         assert_eq!(parse_version_tuple("3.12.14"), Some((3, 12, 14)));
         assert_eq!(parse_version_tuple("3.11"), Some((3, 11, 0)));
         assert_eq!(parse_version_tuple("invalid"), None);
+    }
+
+    #[test]
+    fn prunes_nested_non_project_dirs_without_skipping_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("build");
+        let kept_venv = root.join("app").join(".venv");
+        std::fs::create_dir_all(&kept_venv).unwrap();
+        std::fs::write(kept_venv.join("pyvenv.cfg"), "version = 3.12.4\n").unwrap();
+
+        for skipped in [".tox", ".gradle", "node_modules", "Windows", "$RECYCLE.BIN"] {
+            let skipped_venv = root.join(skipped).join(".venv");
+            std::fs::create_dir_all(&skipped_venv).unwrap();
+            std::fs::write(skipped_venv.join("pyvenv.cfg"), "version = 3.12.4\n").unwrap();
+        }
+
+        let ignore = IgnoreEngine::from_text(Path::new(".uv-migrator-ignore"), "").unwrap();
+        let venvs = scan_with_inspection(&root, &ignore, true, Inspection::Quick).unwrap();
+        assert_eq!(venvs.len(), 1);
+        assert_eq!(venvs[0].venv_dir, kept_venv);
     }
 }
 

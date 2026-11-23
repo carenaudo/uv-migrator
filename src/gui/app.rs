@@ -33,7 +33,11 @@ pub enum BackgroundEvent {
     ScanComplete {
         generation: u64,
         input: ScanInput,
-        result: Result<(Vec<PythonRuntime>, Vec<VenvInfo>), String>,
+        result: Result<Vec<VenvInfo>, String>,
+    },
+    PythonsDiscovered {
+        generation: u64,
+        pythons: Vec<PythonRuntime>,
     },
     MigrationProgress {
         index: usize,
@@ -70,6 +74,9 @@ pub struct UvMigratorApp {
     pub ignore_text: String,
     ignore_file: PathBuf,
     pub is_scanning: bool,
+    pub is_discovering_pythons: bool,
+    has_discovered_pythons: bool,
+    python_generation: u64,
     scan_generation: u64,
     scanned_input: Option<ScanInput>,
     scan_error: Option<String>,
@@ -116,6 +123,9 @@ impl UvMigratorApp {
             ignore_text: String::new(),
             ignore_file: PathBuf::new(),
             is_scanning: false,
+            is_discovering_pythons: false,
+            has_discovered_pythons: false,
+            python_generation: 0,
             scan_generation: 0,
             scanned_input: None,
             scan_error: None,
@@ -189,6 +199,22 @@ impl UvMigratorApp {
         }
     }
 
+    pub fn start_python_discovery(&mut self) {
+        if self.is_migrating || self.is_discovering_pythons {
+            return;
+        }
+        self.is_discovering_pythons = true;
+        self.python_generation += 1;
+        let generation = self.python_generation;
+        let uv = self.uv_info.clone();
+        let tx = self.sender.clone();
+
+        std::thread::spawn(move || {
+            let pythons = discover_all_pythons(uv.as_ref());
+            let _ = tx.send(BackgroundEvent::PythonsDiscovered { generation, pythons });
+        });
+    }
+
     pub fn start_background_scan(&mut self) {
         if self.is_migrating || self.search_path.trim().is_empty() {
             return;
@@ -202,8 +228,11 @@ impl UvMigratorApp {
             ignore_file: self.ignore_file.clone(),
             ignore_text: self.ignore_text.clone(),
         };
-        let uv = self.uv_info.clone();
         let tx = self.sender.clone();
+
+        if !self.has_discovered_pythons && !self.is_discovering_pythons {
+            self.start_python_discovery();
+        }
 
         std::thread::spawn(move || {
             let result = (|| {
@@ -212,9 +241,7 @@ impl UvMigratorApp {
                     return Err(format!("Search root is not a directory: {}", path.display()));
                 }
                 let ignore_engine = IgnoreEngine::from_text(&input.ignore_file, &input.ignore_text)?;
-                let venvs = scan_with_inspection(&path, &ignore_engine, true, Inspection::Detailed)?;
-                let pythons = discover_all_pythons(uv.as_ref());
-                Ok((pythons, venvs))
+                scan_with_inspection(&path, &ignore_engine, true, Inspection::Detailed)
             })();
             let _ = tx.send(BackgroundEvent::ScanComplete { generation, input, result });
         });
@@ -229,7 +256,11 @@ impl UvMigratorApp {
     }
 
     fn can_start_migration(&self) -> bool {
-        !self.is_migrating && self.scan_is_current() && self.uv_info.is_some() && !self.selected_venvs.is_empty()
+        !self.is_migrating
+            && !self.is_discovering_pythons
+            && self.scan_is_current()
+            && self.uv_info.is_some()
+            && !self.selected_venvs.is_empty()
     }
 
     pub fn start_migration(&mut self) {
@@ -339,14 +370,13 @@ impl UvMigratorApp {
                     if input.root != self.search_path || input.ignore_text != self.ignore_text || input.ignore_file != self.ignore_file {
                         continue;
                     }
-                    let (pythons, venvs) = match result {
-                        Ok(scan) => scan,
+                    let venvs = match result {
+                        Ok(venvs) => venvs,
                         Err(error) => {
                             self.scan_error = Some(error);
                             continue;
                         }
                     };
-                    self.pythons = pythons;
                     let same_root = self.scanned_input.as_ref().is_some_and(|previous| previous.root == input.root);
                     let previous_paths: HashSet<_> = self.venvs.iter().map(|venv| &venv.venv_dir).collect();
                     let mut selected = HashSet::new();
@@ -358,6 +388,14 @@ impl UvMigratorApp {
                     self.selected_venvs = selected;
                     self.venvs = venvs;
                     self.scanned_input = Some(input);
+                }
+                BackgroundEvent::PythonsDiscovered { generation, pythons } => {
+                    if generation != self.python_generation {
+                        continue;
+                    }
+                    self.is_discovering_pythons = false;
+                    self.has_discovered_pythons = true;
+                    self.pythons = pythons;
                 }
                 BackgroundEvent::CachePrepared => {
                     self.progress_text = "Cache preparation complete. Rebuilding environments...".to_string();
@@ -473,7 +511,7 @@ impl eframe::App for UvMigratorApp {
         });
 
         // Request continuous repaint if an async job is active
-        if self.is_scanning || self.is_migrating {
+        if self.is_scanning || self.is_discovering_pythons || self.is_migrating {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
@@ -548,12 +586,21 @@ impl UvMigratorApp {
             self.scan_from_disk();
         }
 
+        if is_bare_drive_root(&self.search_path) {
+            ui.add_space(4.0);
+            ui.label(
+                RichText::new("Tip: You selected a drive root. For faster scans, choose a specific projects folder instead.")
+                    .color(Color32::from_rgb(255, 190, 80))
+                    .small(),
+            );
+        }
+
         ui.add_space(15.0);
 
         if self.is_scanning {
             ui.horizontal(|ui| {
                 ui.spinner();
-                ui.label(RichText::new("Scanning directories and discovering runtimes...").italics());
+                ui.label(RichText::new("Scanning directories for virtual environments...").italics());
             });
         } else if self.scan_is_current() {
             // Summary cards
@@ -566,10 +613,27 @@ impl UvMigratorApp {
                 });
 
                 egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.set_min_width(200.0);
-                    ui.label(RichText::new(format!("{} Python Runtimes", self.pythons.len())).strong().size(16.0));
-                    let uv_count = self.pythons.iter().filter(|p| matches!(p.kind, PythonKind::UvManaged)).count();
-                    ui.label(format!("{} uv-managed, {} system/conda", uv_count, self.pythons.len() - uv_count));
+                    ui.set_min_width(240.0);
+                    if self.is_discovering_pythons {
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label(RichText::new("Discovering Python runtimes...").italics());
+                        });
+                        ui.label("Checking PATH and uv toolchains");
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("{} Python Runtimes", self.pythons.len())).strong().size(16.0));
+                            if ui
+                                .add_enabled(!self.is_migrating, egui::Button::new("🔄 Re-scan").small())
+                                .on_hover_text("Re-scan host for installed Python runtimes")
+                                .clicked()
+                            {
+                                self.start_python_discovery();
+                            }
+                        });
+                        let uv_count = self.pythons.iter().filter(|p| matches!(p.kind, PythonKind::UvManaged)).count();
+                        ui.label(format!("{} uv-managed, {} system/conda", uv_count, self.pythons.len().saturating_sub(uv_count)));
+                    }
                 });
             });
 
@@ -895,6 +959,20 @@ impl UvMigratorApp {
     }
 }
 
+fn is_bare_drive_root(path: &str) -> bool {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    Path::new(trimmed).parent().is_none()
+        || trimmed == "/"
+        || trimmed == "\\"
+        || (trimmed.len() == 3
+            && trimmed.as_bytes()[0].is_ascii_alphabetic()
+            && trimmed.as_bytes()[1] == b':'
+            && matches!(trimmed.as_bytes()[2], b'\\' | b'/'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -923,11 +1001,7 @@ mod tests {
         }
     }
 
-    fn send_scan(
-        app: &mut UvMigratorApp,
-        generation: u64,
-        result: Result<(Vec<PythonRuntime>, Vec<VenvInfo>), String>,
-    ) {
+    fn finish_scan(app: &mut UvMigratorApp, generation: u64, result: Result<Vec<VenvInfo>, String>) {
         app.sender.send(BackgroundEvent::ScanComplete {
             generation,
             input: ScanInput {
@@ -940,8 +1014,9 @@ mod tests {
         app.poll_events();
     }
 
-    fn finish_scan(app: &mut UvMigratorApp, generation: u64, result: Result<Vec<VenvInfo>, String>) {
-        send_scan(app, generation, result.map(|venvs| (Vec::new(), venvs)));
+    fn finish_pythons(app: &mut UvMigratorApp, generation: u64, pythons: Vec<PythonRuntime>) {
+        app.sender.send(BackgroundEvent::PythonsDiscovered { generation, pythons }).unwrap();
+        app.poll_events();
     }
 
     #[test]
@@ -952,13 +1027,14 @@ mod tests {
         app.start_background_scan();
         assert!(app.search_path.is_empty());
         assert!(!app.is_scanning);
+        assert!(!app.is_discovering_pythons);
         assert_eq!(app.scan_generation, 0);
         assert!(!app.scan_is_current());
         assert!(app.venvs.is_empty() && app.pythons.is_empty());
     }
 
     #[test]
-    fn new_scan_replaces_both_result_lists() {
+    fn new_scan_replaces_venvs_while_python_discovery_updates_independently() {
         let mut app = app();
         let runtime = |name: &str| PythonRuntime {
             version: "3.12.4".into(),
@@ -970,21 +1046,41 @@ mod tests {
             architecture: String::new(),
             is_default: false,
         };
-        send_scan(&mut app, 0, Ok((vec![runtime("old-python")], vec![
-            environment("root/project/.venv", false),
-        ])));
+        finish_pythons(&mut app, 0, vec![runtime("old-python")]);
+        finish_scan(&mut app, 0, Ok(vec![environment("root/project/.venv", false)]));
         assert_eq!(app.pythons[0].path, Path::new("old-python"));
         assert_eq!(app.venvs.len(), 1);
 
         app.search_path = "other-root".into();
         assert!(!app.scan_is_current());
         app.scan_generation = 1;
-        send_scan(&mut app, 1, Ok((vec![runtime("new-python")], Vec::new())));
+        finish_scan(&mut app, 1, Ok(Vec::new()));
         assert!(app.scan_is_current());
-        assert_eq!(app.pythons.len(), 1);
-        assert_eq!(app.pythons[0].path, Path::new("new-python"));
+        assert_eq!(app.pythons[0].path, Path::new("old-python"));
         assert!(app.venvs.is_empty());
         assert!(app.selected_venvs.is_empty());
+
+        app.python_generation = 2;
+        app.is_discovering_pythons = true;
+        finish_pythons(&mut app, 1, vec![runtime("stale-python")]);
+        assert!(app.is_discovering_pythons);
+        assert_eq!(app.pythons[0].path, Path::new("old-python"));
+        finish_pythons(&mut app, 2, vec![runtime("new-python")]);
+        assert!(!app.is_discovering_pythons);
+        assert_eq!(app.pythons.len(), 1);
+        assert_eq!(app.pythons[0].path, Path::new("new-python"));
+    }
+
+    #[test]
+    fn bare_drive_root_detection() {
+        assert!(!is_bare_drive_root(""));
+        assert!(!is_bare_drive_root("   "));
+        assert!(is_bare_drive_root("/"));
+        assert!(is_bare_drive_root("\\"));
+        assert!(is_bare_drive_root("C:\\"));
+        assert!(is_bare_drive_root("D:/"));
+        assert!(!is_bare_drive_root("D:\\programacion"));
+        assert!(!is_bare_drive_root("/home/user/projects"));
     }
 
     #[test]
@@ -1032,12 +1128,18 @@ mod tests {
         let mut app = app();
         finish_scan(&mut app, 0, Ok(vec![environment("root/project/.venv", false)]));
         assert!(app.can_start_migration());
+        app.is_discovering_pythons = true;
+        assert!(!app.can_start_migration());
+        app.is_discovering_pythons = false;
         app.is_migrating = true;
         app.progress_fraction = 0.5;
         app.start_migration();
         app.start_background_scan();
+        app.start_python_discovery();
         assert_eq!(app.progress_fraction, 0.5);
         assert!(!app.is_scanning);
+        assert!(!app.is_discovering_pythons);
         assert_eq!(app.scan_generation, 0);
+        assert_eq!(app.python_generation, 0);
     }
 }
