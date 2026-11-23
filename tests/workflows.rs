@@ -77,7 +77,7 @@ fn cache_preparation_leaves_the_batch_intact_on_failure() {
         version: String::new(),
     };
     let error =
-        prepare_migration_cache(&environments, &uv, &[], &PythonPolicy::Same, false).unwrap_err();
+        prepare_migration_cache(&environments, &uv, &[], &PythonPolicy::Same, false, false).unwrap_err();
     assert_eq!(environments[1].venv_dir, second);
     assert!(
         error.contains(&environments[1].venv_dir.display().to_string()),
@@ -285,7 +285,7 @@ fn preflight_keeps_existing_backup_and_snapshot_intact() {
     fs::write(&snapshot, "original snapshot").unwrap();
     fs::create_dir(&backup).unwrap();
 
-    let result = migrate_environment(&scanned[0], &uv, &[], &PythonPolicy::Same, false);
+    let result = migrate_environment(&scanned[0], &uv, &[], &PythonPolicy::Same, false, false);
     assert!(!result.success);
     assert!(result.error.unwrap().contains("backup from an earlier run"));
     assert_eq!(fs::read_to_string(&snapshot).unwrap(), "original snapshot");
@@ -293,7 +293,7 @@ fn preflight_keeps_existing_backup_and_snapshot_intact() {
     assert!(backup.is_dir());
 
     fs::remove_dir(&backup).unwrap();
-    let result = migrate_environment(&scanned[0], &uv, &[], &PythonPolicy::Same, false);
+    let result = migrate_environment(&scanned[0], &uv, &[], &PythonPolicy::Same, false, false);
     assert!(!result.success);
     assert!(!result.restored);
     assert_eq!(fs::read_to_string(&snapshot).unwrap(), "original snapshot");
@@ -301,7 +301,7 @@ fn preflight_keeps_existing_backup_and_snapshot_intact() {
     assert!(!backup.exists());
 
     fs::create_dir_all(packages(&path)).unwrap();
-    let result = migrate_environment(&scanned[0], &uv, &[], &PythonPolicy::Same, false);
+    let result = migrate_environment(&scanned[0], &uv, &[], &PythonPolicy::Same, false, false);
     assert!(!result.success);
     assert!(result.restored);
     assert!(result

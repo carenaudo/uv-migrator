@@ -14,8 +14,10 @@ pub struct InstalledPackage {
     /// Distribution name as recorded in METADATA.
     pub name: String,
     pub version: Option<String>,
-    /// How to reinstall it: a `requirements.txt` line.
+    /// How to reinstall it at the exact same version: a `requirements.txt` line.
     pub requirement: String,
+    /// How to reinstall it when upgrading packages (unpinned for index packages; keeps direct/editable/VCS provenance).
+    pub upgrade_requirement: String,
 }
 
 /// Read every `.dist-info` in the environment's site-packages.
@@ -71,7 +73,12 @@ fn read_dist_info(dir: &Path) -> Result<InstalledPackage, String> {
         Err(error) => return Err(format!("Could not read {}: {error}", direct_url_path.display())),
     };
     let requirement = requirement_line(&name, version.as_deref(), direct_url.as_ref());
-    Ok(InstalledPackage { name, version, requirement })
+    let upgrade_requirement = if direct_url.is_some() {
+        requirement.clone()
+    } else {
+        name.clone()
+    };
+    Ok(InstalledPackage { name, version, requirement, upgrade_requirement })
 }
 
 /// Name and version from the headers of a METADATA file.
@@ -169,18 +176,42 @@ pub fn render(pkgs: &[InstalledPackage], venv_dir: &Path, python_version: &str) 
     out
 }
 
+/// Render an unpinned requirements list for upgrading packages to the latest compatible versions.
+/// Editable, VCS, and direct-URL installs preserve their original source specification.
+pub fn render_unpinned(pkgs: &[InstalledPackage], venv_dir: &Path, python_version: &str) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "# uv-migrator upgrade requirements for {}", venv_dir.display());
+    let _ = writeln!(out, "# Source Python {}", python_version);
+    for p in pkgs {
+        let _ = writeln!(out, "{}", p.upgrade_requirement);
+    }
+    out
+}
+
 /// Differences between what was installed before and what is installed now.
 /// Empty means the new environment holds the same packages at the same versions.
 pub fn diff(before: &[InstalledPackage], after: &[InstalledPackage]) -> Vec<String> {
+    diff_with_policy(before, after, false)
+}
+
+/// Differences between what was installed before and what is installed now.
+/// When `allow_version_changes` is true, upgraded versions are accepted while missing packages still fail.
+pub fn diff_with_policy(
+    before: &[InstalledPackage],
+    after: &[InstalledPackage],
+    allow_version_changes: bool,
+) -> Vec<String> {
     let mut problems = Vec::new();
     for old in before {
         let key = normalize_name(&old.name);
         match after.iter().find(|p| normalize_name(&p.name) == key) {
             None => problems.push(format!("{} is missing", old.name)),
             Some(new) => {
-                if let (Some(ov), Some(nv)) = (&old.version, &new.version) {
-                    if ov != nv {
-                        problems.push(format!("{} changed {} -> {}", old.name, ov, nv));
+                if !allow_version_changes {
+                    if let (Some(ov), Some(nv)) = (&old.version, &new.version) {
+                        if ov != nv {
+                            problems.push(format!("{} changed {} -> {}", old.name, ov, nv));
+                        }
                     }
                 }
             }
@@ -198,6 +229,7 @@ mod tests {
             name: name.to_string(),
             version: Some(version.to_string()),
             requirement: format!("{}=={}", name, version),
+            upgrade_requirement: name.to_string(),
         }
     }
 
@@ -245,7 +277,24 @@ mod tests {
         let before = vec![pkg("numpy", "2.1.0"), pkg("Foo_Bar", "1.0"), pkg("gone", "3.0")];
         let after = vec![pkg("numpy", "2.2.0"), pkg("foo-bar", "1.0"), pkg("extra", "1.0")];
         assert_eq!(diff(&before, &after), vec!["numpy changed 2.1.0 -> 2.2.0", "gone is missing"]);
+        assert_eq!(diff_with_policy(&before, &after, true), vec!["gone is missing"]);
         assert!(diff(&before, &before).is_empty());
+    }
+
+    #[test]
+    fn render_unpinned_strips_index_versions_but_keeps_direct_sources() {
+        let pkgs = vec![
+            pkg("pillow", "10.4.0"),
+            InstalledPackage {
+                name: "localproj".to_string(),
+                version: Some("0.1.0".to_string()),
+                requirement: "-e file:///work/localproj".to_string(),
+                upgrade_requirement: "-e file:///work/localproj".to_string(),
+            },
+        ];
+        let rendered = render_unpinned(&pkgs, Path::new("/proj/.venv"), "3.12.4");
+        let lines: Vec<&str> = rendered.lines().filter(|l| !l.starts_with('#')).collect();
+        assert_eq!(lines, vec!["pillow", "-e file:///work/localproj"]);
     }
 
     #[test]

@@ -87,6 +87,7 @@ pub struct UvMigratorApp {
     pub dry_run: bool,
     force_reinstall: bool,
     pub auto_install_python: bool,
+    pub upgrade_packages: bool,
 
     // Step 4 migration progress
     pub is_migrating: bool,
@@ -134,6 +135,7 @@ impl UvMigratorApp {
             dry_run: false,
             force_reinstall: false,
             auto_install_python: true,
+            upgrade_packages: false,
             is_migrating: false,
             progress_fraction: 0.0,
             progress_text: "Ready to start".to_string(),
@@ -318,13 +320,14 @@ impl UvMigratorApp {
         let pythons = self.pythons.clone();
         let dry_run = self.dry_run;
         let allow_downloads = self.auto_install_python;
+        let upgrade_packages = self.upgrade_packages;
         let tx = self.sender.clone();
 
         std::thread::spawn(move || {
             let initial_free = if dry_run { None } else { disk_free_space_gb(&root) };
             if prepare_cache {
                 if let Err(error) = prepare_migration_cache(
-                    &venvs_to_migrate, &uv, &pythons, &policy, allow_downloads,
+                    &venvs_to_migrate, &uv, &pythons, &policy, allow_downloads, upgrade_packages,
                 ) {
                     let _ = tx.send(BackgroundEvent::CachePreparationFailed(error));
                     return;
@@ -338,7 +341,7 @@ impl UvMigratorApp {
                 let res = if dry_run {
                     preview_environment(venv, &pythons, &policy, true)
                 } else {
-                    migrate_environment(venv, &uv, &pythons, &policy, allow_downloads)
+                    migrate_environment(venv, &uv, &pythons, &policy, allow_downloads, upgrade_packages)
                 };
                 results.push(res.clone());
 
@@ -844,6 +847,15 @@ impl UvMigratorApp {
                 &mut self.force_reinstall,
                 "Force reinstall (prepare packages in the uv cache first)",
             ));
+            ui.checkbox(
+                &mut self.upgrade_packages,
+                RichText::new("Upgrade all packages to latest compatible versions").strong(),
+            );
+            ui.label(
+                RichText::new("  Resolves newest PyPI versions for the target Python (helpful when jumping to Python 3.14). Exact original pins are still saved in the snapshot; editable/VCS/local installs keep their source.")
+                    .color(Color32::LIGHT_GRAY)
+                    .small(),
+            );
         });
 
         ui.add_space(20.0);

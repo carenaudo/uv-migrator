@@ -135,6 +135,7 @@ pub fn prepare_migration_cache(
     detected_pythons: &[PythonRuntime],
     policy: &PythonPolicy,
     allow_python_downloads: bool,
+    upgrade_packages: bool,
 ) -> Result<(), String> {
     let mut checked_cache = false;
     for venv in venvs {
@@ -161,8 +162,12 @@ pub fn prepare_migration_cache(
                 .tempdir_in(&venv.project_dir)
                 .map_err(|error| format!("Could not create a temporary directory: {error}"))?;
             let requirements = staging.path().join("requirements.txt");
-            let snapshot = snapshot::render(&installed, &venv.venv_dir, &venv.python_version_raw);
-            std::fs::write(&requirements, snapshot)
+            let rendered = if upgrade_packages {
+                snapshot::render_unpinned(&installed, &venv.venv_dir, &venv.python_version_raw)
+            } else {
+                snapshot::render(&installed, &venv.venv_dir, &venv.python_version_raw)
+            };
+            std::fs::write(&requirements, rendered)
                 .map_err(|error| format!("Could not write temporary requirements: {error}"))?;
             build_and_verify(
                 uv,
@@ -172,6 +177,7 @@ pub fn prepare_migration_cache(
                 allow_python_downloads,
                 &requirements,
                 &installed,
+                upgrade_packages,
             )?;
             staging.close()
                 .map_err(|error| format!("Could not remove the temporary environment: {error}"))
@@ -188,8 +194,8 @@ pub fn prepare_migration_cache(
 ///
 /// 1. snapshot every installed package, with its source, to a sidecar file;
 /// 2. move the old environment aside (not delete it);
-/// 3. build the new one in its place from the snapshot;
-/// 4. verify that the same packages are installed at the same versions;
+/// 3. build the new one in its place from the snapshot (or unpinned requirements if `upgrade_packages` is true);
+/// 4. verify that the expected packages are installed (at exact versions unless `upgrade_packages` is true);
 /// 5. only then delete the old environment. If any step fails, put it back.
 pub fn migrate_environment(
     venv: &VenvInfo,
@@ -197,6 +203,7 @@ pub fn migrate_environment(
     detected_pythons: &[PythonRuntime],
     policy: &PythonPolicy,
     allow_python_downloads: bool,
+    upgrade_packages: bool,
 ) -> MigrationResult {
     let mut result = plan_environment(venv, detected_pythons, policy, false);
     let Some(target_python) = result.new_python_version.clone() else { return result };
@@ -231,6 +238,32 @@ pub fn migrate_environment(
     }
     result.snapshot_path = Some(snap_path.clone());
 
+    let upgrade_req_file = if upgrade_packages {
+        let mut temp = match tempfile::Builder::new()
+            .prefix(".uv-migrator-upgrade-")
+            .suffix(".txt")
+            .tempfile_in(&venv.project_dir)
+        {
+            Ok(file) => file,
+            Err(e) => {
+                result.error = Some(format!("Could not create temporary upgrade requirements: {} (environment untouched)", e));
+                return result;
+            }
+        };
+        let unpinned = snapshot::render_unpinned(&installed, &venv.venv_dir, &venv.python_version_raw);
+        if let Err(e) = std::io::Write::write_all(&mut temp, unpinned.as_bytes()) {
+            result.error = Some(format!("Could not write temporary upgrade requirements: {} (environment untouched)", e));
+            return result;
+        }
+        Some(temp)
+    } else {
+        None
+    };
+    let install_requirements_path = upgrade_req_file
+        .as_ref()
+        .map(|file| file.path().to_path_buf())
+        .unwrap_or_else(|| snap_path.clone());
+
     // 2. Move the old environment aside.
     if let Err(e) = rename_with_retry(&venv.venv_dir, &backup) {
         result.error = Some(format!("Could not move the old environment aside: {} (environment untouched)", e));
@@ -239,7 +272,16 @@ pub fn migrate_environment(
 
     // 3-4. Build and verify. 5. Delete the old one only on success.
     let system_site = uses_system_site_packages(&backup);
-    match build_and_verify(uv, &venv.venv_dir, &target_python, system_site, allow_python_downloads, &snap_path, &installed) {
+    match build_and_verify(
+        uv,
+        &venv.venv_dir,
+        &target_python,
+        system_site,
+        allow_python_downloads,
+        &install_requirements_path,
+        &installed,
+        upgrade_packages,
+    ) {
         Ok(()) => {
             result.new_size_bytes = Some(dir_size_bytes(&venv.venv_dir));
             result.success = true;
@@ -273,6 +315,7 @@ fn build_and_verify(
     allow_python_downloads: bool,
     snap_path: &Path,
     before: &[InstalledPackage],
+    upgrade_packages: bool,
 ) -> Result<(), String> {
     uv_create_venv(&uv.path, venv_dir, target_python, system_site_packages, allow_python_downloads)?;
     let py = venv_python_path(venv_dir);
@@ -283,7 +326,7 @@ fn build_and_verify(
         uv_pip_install_requirements(&uv.path, &py, snap_path)?;
     }
     let after = snapshot::read_installed(venv_dir)?;
-    let problems = snapshot::diff(before, &after);
+    let problems = snapshot::diff_with_policy(before, &after, upgrade_packages);
     if !problems.is_empty() {
         return Err(format!("New environment does not match the old one: {}", problems.join("; ")));
     }

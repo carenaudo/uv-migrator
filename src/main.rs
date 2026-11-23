@@ -135,6 +135,7 @@ fn migrate(args: MigrateArgs) -> Result<bool, String> {
             &pythons,
             &args.python,
             !args.no_python_downloads,
+            args.upgrade_packages,
         )?;
     }
 
@@ -144,7 +145,14 @@ fn migrate(args: MigrateArgs) -> Result<bool, String> {
         .iter()
         .map(|venv| {
             let result = if let Some(uv) = uv.as_ref().filter(|_| args.apply) {
-                migrate_environment(venv, uv, &pythons, &args.python, !args.no_python_downloads)
+                migrate_environment(
+                    venv,
+                    uv,
+                    &pythons,
+                    &args.python,
+                    !args.no_python_downloads,
+                    args.upgrade_packages,
+                )
             } else {
                 preview_environment(venv, &pythons, &args.python, args.details)
             };

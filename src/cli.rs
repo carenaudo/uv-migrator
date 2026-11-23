@@ -100,6 +100,9 @@ pub struct MigrateArgs {
     /// Require an installed Python interpreter
     #[arg(long, requires = "apply")]
     pub no_python_downloads: bool,
+    /// Upgrade all index packages to the latest versions compatible with the target Python
+    #[arg(long)]
+    pub upgrade_packages: bool,
     #[command(flatten)]
     pub output: OutputArgs,
 }
